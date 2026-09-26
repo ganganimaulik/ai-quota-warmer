@@ -2,7 +2,8 @@
 """
 AI Quota Warmer - Native Desktop GUI (Tkinter) with Actual 5-Hour Usage Detector
 ---------------------------------------------------------------------------------
-A lightweight desktop app displaying real-time actual 5-hour limit usage for Claude & Codex.
+A lightweight desktop app displaying real-time actual 5-hour limit usage for every
+configured Claude & Codex account.
 
 Threading model: Tk is not thread-safe, so every widget update happens on the
 main thread. Telemetry reads (which walk hundreds of session logs) and warm-up
@@ -23,10 +24,13 @@ from quota_warmer import (
     uninstall_startup_autorun,
     cooldown_remaining,
     load_state,
+    load_accounts,
+    find_account,
+    get_all_usage,
 )
-from usage_detector import get_actual_usage_summary
 
 REFRESH_MS = 5000
+SCREEN_MARGIN = 80       # title bar + taskbar allowance when sizing the window
 
 
 class QuotaWarmerApp:
@@ -43,6 +47,9 @@ class QuotaWarmerApp:
         self._closing = False
         self._pump_id = None
         self._tick_id = None
+        self.cards = {}          # account key -> widgets of its card
+        self.card_keys = None    # account keys the cards were built for
+        self._scrolling = False  # cards taller than the screen allows
 
         self.setup_styles()
         self.create_widgets()
@@ -72,7 +79,7 @@ class QuotaWarmerApp:
 
         tk.Label(
             hdr,
-            text="Real-time 5-Hour Rate Limit Telemetry for Claude Code & Codex CLI",
+            text="Real-time 5-Hour Rate Limit Telemetry for every Claude Code & Codex CLI account",
             font=("Segoe UI", 9),
             fg="#94a3b8",
             bg="#121826",
@@ -81,87 +88,38 @@ class QuotaWarmerApp:
         content = tk.Frame(self.root, bg="#0a0e17", padx=16, pady=12)
         content.pack(fill="both", expand=True)
 
-        # 1. Claude Card
-        claude_card = tk.Frame(content, bg="#121826", padx=14, pady=12,
-                               highlightbackground="#a855f7", highlightthickness=1)
-        claude_card.pack(fill="x", pady=(0, 10))
+        # 1. One card per account, (re)built by _build_cards once telemetry
+        #    arrives. They sit on a canvas so any number of accounts can scroll.
+        cards_box = tk.Frame(content, bg="#0a0e17")
+        cards_box.pack(fill="x")
+        self.cards_scroll = ttk.Scrollbar(cards_box, orient="vertical")
+        self.cards_canvas = tk.Canvas(cards_box, bg="#0a0e17", highlightthickness=0, bd=0, height=60,
+                                      yscrollcommand=self.cards_scroll.set)
+        self.cards_scroll.config(command=self.cards_canvas.yview)
+        self.cards_canvas.pack(side="left", fill="x", expand=True)
+        self.cards_frame = tk.Frame(self.cards_canvas, bg="#0a0e17")
+        self._cards_item = self.cards_canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
+        self.cards_frame.bind("<Configure>", lambda _e: self._fit_cards())
+        self.cards_canvas.bind("<Configure>",
+                               lambda e: self.cards_canvas.itemconfigure(self._cards_item, width=e.width))
+        # The wheel scrolls the cards only while the pointer is over them.
+        self.cards_canvas.bind("<Enter>", lambda _e: self._bind_wheel(True))
+        self.cards_canvas.bind("<Leave>", lambda _e: self._bind_wheel(False))
+        tk.Label(self.cards_frame, text="Loading accounts...", font=("Segoe UI", 9),
+                 fg="#94a3b8", bg="#0a0e17").pack(pady=8)
 
-        cl_hdr = tk.Frame(claude_card, bg="#121826")
-        cl_hdr.pack(fill="x")
-        tk.Label(cl_hdr, text="🟣 Anthropic Claude Code", font=("Segoe UI", 11, "bold"),
-                 fg="#c084fc", bg="#121826").pack(side="left")
-        self.lbl_claude_badge = tk.Label(cl_hdr, text="...", font=("Segoe UI", 8, "bold"),
-                                         fg="#94a3b8", bg="#121826")
-        self.lbl_claude_badge.pack(side="right")
-
-        self.lbl_claude_timer = tk.Label(claude_card, text="--:--:--", font=("Consolas", 24, "bold"),
-                                         fg="#ffffff", bg="#121826")
-        self.lbl_claude_timer.pack(pady=2)
-
-        self.claude_prog = ttk.Progressbar(claude_card, style="Claude.Horizontal.TProgressbar",
-                                           orient="horizontal", mode="determinate")
-        self.claude_prog.pack(fill="x", pady=4)
-
-        self.lbl_claude_details = tk.Label(claude_card, text="Loading telemetry...",
-                                           font=("Segoe UI", 8), fg="#cbd5e1", bg="#121826",
-                                           wraplength=560, justify="center")
-        self.lbl_claude_details.pack()
-
-        # 2. Codex Card
-        codex_card = tk.Frame(content, bg="#121826", padx=14, pady=12,
-                              highlightbackground="#06b6d4", highlightthickness=1)
-        codex_card.pack(fill="x", pady=(0, 10))
-
-        cx_hdr = tk.Frame(codex_card, bg="#121826")
-        cx_hdr.pack(fill="x")
-        tk.Label(cx_hdr, text="🤖 OpenAI Codex CLI", font=("Segoe UI", 11, "bold"),
-                 fg="#38bdf8", bg="#121826").pack(side="left")
-        self.lbl_codex_badge = tk.Label(cx_hdr, text="...", font=("Segoe UI", 8, "bold"),
-                                        fg="#94a3b8", bg="#121826")
-        self.lbl_codex_badge.pack(side="right")
-
-        self.lbl_codex_timer = tk.Label(codex_card, text="--:--:--", font=("Consolas", 24, "bold"),
-                                        fg="#ffffff", bg="#121826")
-        self.lbl_codex_timer.pack(pady=2)
-
-        self.codex_prog = ttk.Progressbar(codex_card, style="Codex.Horizontal.TProgressbar",
-                                          orient="horizontal", mode="determinate")
-        self.codex_prog.pack(fill="x", pady=4)
-
-        self.lbl_codex_details = tk.Label(codex_card, text="Loading telemetry...",
-                                          font=("Segoe UI", 8), fg="#cbd5e1", bg="#121826",
-                                          wraplength=560, justify="center")
-        self.lbl_codex_details.pack()
-
-        # Buttons
+        # 2. Buttons
         btn_frame = tk.Frame(content, bg="#0a0e17")
-        btn_frame.pack(fill="x", pady=(0, 10))
+        btn_frame.pack(fill="x", pady=(4, 10))
 
         self.btn_warm_all = tk.Button(
-            btn_frame, text="🔥 Warm Up Both Now", font=("Segoe UI", 10, "bold"),
+            btn_frame, text="🔥 Warm Up All Now", font=("Segoe UI", 10, "bold"),
             bg="#6366f1", fg="white", relief="flat", pady=8, cursor="hand2",
             command=lambda: self.start_warmup("all"),
         )
         self.btn_warm_all.pack(fill="x", pady=(0, 4))
 
-        sub_btns = tk.Frame(btn_frame, bg="#0a0e17")
-        sub_btns.pack(fill="x")
-
-        self.btn_warm_claude = tk.Button(
-            sub_btns, text="🟣 Warm Claude", font=("Segoe UI", 8, "bold"),
-            bg="#7c3aed", fg="white", relief="flat", pady=5,
-            command=lambda: self.start_warmup("claude"),
-        )
-        self.btn_warm_claude.pack(side="left", fill="x", expand=True, padx=(0, 2))
-
-        self.btn_warm_codex = tk.Button(
-            sub_btns, text="🤖 Warm Codex", font=("Segoe UI", 8, "bold"),
-            bg="#0284c7", fg="white", relief="flat", pady=5,
-            command=lambda: self.start_warmup("codex"),
-        )
-        self.btn_warm_codex.pack(side="right", fill="x", expand=True, padx=(2, 0))
-
-        # Settings
+        # 3. Settings
         settings_frame = tk.Frame(content, bg="#121826", padx=12, pady=8)
         settings_frame.pack(fill="x", pady=(0, 10))
 
@@ -178,11 +136,100 @@ class QuotaWarmerApp:
             bg="#334155", fg="white", relief="flat", command=self.request_refresh,
         ).pack(side="right")
 
-        # Console
+        # 4. Console
         self.txt_log = tk.Text(content, bg="#06090e", fg="#94a3b8", font=("Consolas", 8),
                                height=6, relief="flat", padx=6, pady=6)
         self.txt_log.pack(fill="both", expand=True)
         self.log("Actual 5-Hour Usage Detector Desktop UI ready.")
+
+    def _build_cards(self, accounts):
+        """Creates one card per account; called again whenever the list changes."""
+        for child in self.cards_frame.winfo_children():
+            child.destroy()
+        self.cards = {}
+        self.card_keys = [a["key"] for a in accounts]
+
+        if not accounts:
+            tk.Label(
+                self.cards_frame,
+                text="No accounts configured.\nAdd one with: python quota_warmer.py --add-account claude work",
+                font=("Segoe UI", 9), fg="#94a3b8", bg="#0a0e17", justify="center",
+            ).pack(pady=8)
+
+        # Two accounts keep the classic large timer; more get a compact one.
+        timer_size = 24 if len(accounts) <= 2 else 18
+        for acc in accounts:
+            is_claude = acc["tool"] == "claude"
+            card = tk.Frame(self.cards_frame, bg="#121826", padx=14, pady=10,
+                            highlightbackground="#a855f7" if is_claude else "#06b6d4",
+                            highlightthickness=1)
+            card.pack(fill="x", pady=(0, 10))
+
+            head = tk.Frame(card, bg="#121826")
+            head.pack(fill="x")
+            tk.Label(head, text=f"{'🟣' if is_claude else '🤖'} {acc['label']}",
+                     font=("Segoe UI", 11, "bold"), fg="#c084fc" if is_claude else "#38bdf8",
+                     bg="#121826").pack(side="left")
+            button = tk.Button(
+                head, text="Warm", font=("Segoe UI", 8, "bold"),
+                bg="#7c3aed" if is_claude else "#0284c7", fg="white", relief="flat", padx=10,
+                state="disabled" if self._busy else "normal",
+                command=lambda k=acc["key"]: self.start_warmup(account=k),
+            )
+            button.pack(side="right", padx=(8, 0))
+            badge = tk.Label(head, text="...", font=("Segoe UI", 8, "bold"), fg="#94a3b8", bg="#121826")
+            badge.pack(side="right")
+
+            tk.Label(card, text=acc["dir"], font=("Segoe UI", 7), fg="#64748b", bg="#121826").pack(anchor="w")
+            timer = tk.Label(card, text="--:--:--", font=("Consolas", timer_size, "bold"),
+                             fg="#ffffff", bg="#121826")
+            timer.pack(pady=1)
+            prog = ttk.Progressbar(card, style=f"{'Claude' if is_claude else 'Codex'}.Horizontal.TProgressbar",
+                                   orient="horizontal", mode="determinate")
+            prog.pack(fill="x", pady=4)
+            details = tk.Label(card, text="Loading telemetry...", font=("Segoe UI", 8), fg="#cbd5e1",
+                               bg="#121826", wraplength=560, justify="center")
+            details.pack()
+
+            self.cards[acc["key"]] = {"tool": acc["tool"], "badge": badge, "timer": timer,
+                                      "prog": prog, "details": details, "button": button}
+
+        self.root.update_idletasks()
+        self._fit_cards()
+        # Grow the window to fit the cards, never beyond the screen.
+        self.root.update_idletasks()
+        target = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - SCREEN_MARGIN)
+        if self.root.winfo_height() < target:
+            self.root.geometry(f"{max(self.root.winfo_width(), 640)}x{target}")
+
+    def _fit_cards(self):
+        """Shows every card while they fit on screen; past that, the cards scroll."""
+        needed = self.cards_frame.winfo_reqheight()
+        # Everything but the cards: header, buttons, settings and console.
+        chrome = self.root.winfo_reqheight() - self.cards_canvas.winfo_reqheight()
+        room = max(200, self.root.winfo_screenheight() - SCREEN_MARGIN - chrome)
+        self.cards_canvas.configure(height=min(needed, room), scrollregion=(0, 0, 0, needed))
+        scrolling = needed > room
+        if scrolling and not self._scrolling:
+            self.cards_scroll.pack(side="right", fill="y", before=self.cards_canvas)
+        elif not scrolling and self._scrolling:
+            self.cards_scroll.pack_forget()
+            self.cards_canvas.yview_moveto(0)
+        self._scrolling = scrolling
+
+    def _bind_wheel(self, on):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            if on:
+                self.root.bind_all(seq, self._on_wheel)
+            else:
+                self.root.unbind_all(seq)
+
+    def _on_wheel(self, event):
+        if not self._scrolling:
+            return
+        # Windows/macOS send <MouseWheel> with a delta; X11 sends buttons 4/5.
+        up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+        self.cards_canvas.yview_scroll(-1 if up else 1, "units")
 
     # -- thread-safe plumbing ------------------------------------------------
 
@@ -226,9 +273,9 @@ class QuotaWarmerApp:
         self._busy = busy
         state = "disabled" if busy else "normal"
         self.btn_warm_all.config(state=state,
-                                 text="⏳ Pinging AI Engines..." if busy else "🔥 Warm Up Both Now")
-        self.btn_warm_claude.config(state=state)
-        self.btn_warm_codex.config(state=state)
+                                 text="⏳ Pinging AI Engines..." if busy else "🔥 Warm Up All Now")
+        for widgets in self.cards.values():
+            widgets["button"].config(state=state)
 
     # -- status --------------------------------------------------------------
 
@@ -240,15 +287,20 @@ class QuotaWarmerApp:
 
         def _worker():
             try:
-                data = get_actual_usage_summary()
+                accounts = load_accounts()
                 state = load_state()
-                cooldowns = {t: cooldown_remaining(t, state) for t in ("claude", "codex")}
-                failures = {t: int((state.get(t) or {}).get("consecutive_failures", 0))
-                            for t in ("claude", "codex")}
+                usage = get_all_usage(accounts, state)
+                snapshot = [
+                    dict(acc.describe(), usage=usage[acc.key],
+                         cooldown=cooldown_remaining(acc.key, state),
+                         failures=int((state.get(acc.key) or {}).get("consecutive_failures", 0)))
+                    for acc in accounts
+                ]
             except Exception as e:
-                self.post(lambda: self._refresh_failed(e))
+                # Bind now: `e` is unset once this except block ends.
+                self.post(lambda exc=e: self._refresh_failed(exc))
                 return
-            self.post(lambda: self.apply_status(data, cooldowns, failures))
+            self.post(lambda: self.apply_status(snapshot))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -256,22 +308,24 @@ class QuotaWarmerApp:
         self._refresh_inflight = False
         self.log(f"Telemetry read failed: {type(exc).__name__}: {exc}")
 
-    def apply_status(self, actual, cooldowns, failures):
+    def apply_status(self, accounts):
         self._refresh_inflight = False
         if not self._alive():
             return
         try:
-            self._render("claude", actual["claude"], cooldowns["claude"], failures["claude"])
-            self._render("codex", actual["codex"], cooldowns["codex"], failures["codex"])
+            if [a["key"] for a in accounts] != self.card_keys:
+                self._build_cards(accounts)
+            for acc in accounts:
+                self._render(acc)
             self.startup_var.set(is_startup_installed())
         except tk.TclError:
             pass
 
-    def _render(self, tool, data, cooldown, failures):
-        badge = self.lbl_claude_badge if tool == "claude" else self.lbl_codex_badge
-        timer = self.lbl_claude_timer if tool == "claude" else self.lbl_codex_timer
-        prog = self.claude_prog if tool == "claude" else self.codex_prog
-        details = self.lbl_claude_details if tool == "claude" else self.lbl_codex_details
+    def _render(self, acc):
+        widgets = self.cards.get(acc["key"])
+        if not widgets:
+            return
+        data, cooldown, failures = acc["usage"], acc["cooldown"], acc["failures"]
 
         if data.get("status") == "ERROR":
             colour = "#f43f5e"
@@ -282,15 +336,15 @@ class QuotaWarmerApp:
         else:
             colour = "#94a3b8"
 
-        badge.config(text=data.get("status", "?"), fg=colour)
-        timer.config(text=data.get("time_remaining", "--:--:--"))
-        prog["value"] = data.get("progress_pct", 0)
+        widgets["badge"].config(text=data.get("status", "?"), fg=colour)
+        widgets["timer"].config(text=data.get("time_remaining", "--:--:--"))
+        widgets["prog"]["value"] = data.get("progress_pct", 0)
 
         if data.get("status") == "ERROR":
-            details.config(text=f"Detector error: {data.get('error')}")
+            widgets["details"].config(text=f"Detector error: {data.get('error')}")
             return
 
-        counter = (f"Prompts: {data.get('user_prompts', 0)}" if tool == "claude"
+        counter = (f"Prompts: {data.get('user_prompts', 0)}" if acc["tool"] == "claude"
                    else f"Turns: {data.get('turns_in_5h', 0)}")
         line = (f"Window: {data.get('window_start')} → Resets: {data.get('window_reset')}  |  "
                 f"{counter}  |  Tokens: {data.get('tokens', {}).get('total', 0):,}")
@@ -301,7 +355,7 @@ class QuotaWarmerApp:
                 line += f"\n{failures} failed warm-up(s) — next retry in {int(cooldown // 60)}m {int(cooldown % 60)}s"
             elif cooldown > 0:
                 line += f"\nCooling down {int(cooldown // 60)}m {int(cooldown % 60)}s before the next auto-warm"
-        details.config(text=line)
+        widgets["details"].config(text=line)
 
     def tick_timer(self):
         self._tick_id = None
@@ -321,21 +375,30 @@ class QuotaWarmerApp:
             self.log("Auto-run on PC Restart: DISABLED" if ok else "Failed to disable auto-run")
         self.startup_var.set(is_startup_installed())
 
-    def start_warmup(self, target="all"):
+    def start_warmup(self, target="all", account=None):
+        """Warms every account matching `target`, or just the account key given."""
         if self._busy:
             return
         self.set_busy(True)
-        self.log(f"Starting warmup for {target.upper()} (may take up to a minute)...")
+        self.log(f"Starting warmup for {account or target.upper()} (may take up to a minute)...")
 
         def _worker():
             try:
-                results = run_trigger_batch(target=target, prompt="hi", notify=True, quiet=True)
+                accounts = None
+                if account:
+                    acc = find_account(account)
+                    if acc is None:
+                        raise ValueError(f"account '{account}' no longer exists")
+                    accounts = [acc]
+                results = run_trigger_batch(target=account or target, prompt="hi", notify=True,
+                                            quiet=True, accounts=accounts)
             except Exception as e:
-                self.post(lambda: self.log(f"Warm-up crashed: {type(e).__name__}: {e}"))
+                msg = f"Warm-up crashed: {type(e).__name__}: {e}"
+                self.post(lambda m=msg: self.log(m))
                 results = {}
-            for name, res in results.items():
-                msg = (f"{name.upper()}: SUCCESS in {res.get('duration')}s" if res.get("success")
-                       else f"{name.upper()}: FAILED - {res.get('error')}")
+            for key, res in results.items():
+                msg = (f"{key}: SUCCESS in {res.get('duration')}s" if res.get("success")
+                       else f"{key}: FAILED - {res.get('error')}")
                 self.post(lambda m=msg: self.log(m))
             self.post(self._warmup_done)
 

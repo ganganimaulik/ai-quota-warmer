@@ -3,14 +3,14 @@
 AI Quota Warmer - Web Dashboard UI with Live Actual Usage Detector
 -------------------------------------------------------------------
 A modern local web dashboard displaying ACTUAL 5-hour limit usage, token counts,
-real reset countdowns, and unattended automation controls for Codex and Claude Code.
+real reset countdowns, and unattended automation controls for every configured
+Codex and Claude Code account.
 """
 
 import json
 import secrets
 import sys
 import threading
-import time
 import webbrowser
 from collections import deque
 from datetime import datetime
@@ -20,11 +20,16 @@ from urllib.parse import urlparse
 from quota_warmer import (
     load_history,
     load_state,
+    load_accounts,
+    find_account,
+    select_accounts,
     cooldown_remaining,
-    trigger_codex,
-    trigger_claude,
+    get_all_usage,
     run_trigger_batch,
-    warm_if_expired,
+    warm_cycle,
+    sleep_until_next_cycle,
+    account_login_status,
+    describe_login,
     is_startup_installed,
     install_startup_autorun,
     uninstall_startup_autorun,
@@ -32,7 +37,6 @@ from quota_warmer import (
     uninstall_scheduled_task,
     SingleInstanceLock,
 )
-from usage_detector import get_actual_usage_summary
 
 PORT = 5055
 HOST = "127.0.0.1"
@@ -57,9 +61,15 @@ def push_event(message, level="info"):
     })
 
 
+def _watcher_log(msg):
+    text = str(msg).strip()
+    level = "success" if text.startswith("[+]") else "error" if text.startswith("[-]") else "info"
+    push_event(text, level)
+
+
 def background_adaptive_watcher():
     """
-    Warms each tool the moment its real 5-hour window resets.
+    Warms each account the moment its real 5-hour window resets.
 
     Shares quota_warmer's persistent cooldown/backoff state and its
     single-instance lock, so running the dashboard alongside the Startup-folder
@@ -79,25 +89,12 @@ def background_adaptive_watcher():
             sleep_for = 60.0
             try:
                 if ADAPTIVE_AUTO_WARM_ENABLED:
-                    actual = get_actual_usage_summary()
-                    waits = []
-                    for tool in ("claude", "codex"):
-                        usage = actual.get(tool) or {}
-                        warm_if_expired(
-                            tool, usage, prompt="hi", notify=True,
-                            log=lambda m, _t=tool: push_event(m, "info"),
-                        )
-                        if usage.get("is_active") and usage.get("remaining_seconds"):
-                            waits.append(float(usage["remaining_seconds"]) + 5)
-                        cd = cooldown_remaining(tool)
-                        if cd > 0:
-                            waits.append(cd + 5)
-                    if waits:
-                        sleep_for = min(waits)
+                    # Re-read every pass so accounts added from the CLI appear without a restart.
+                    sleep_for = warm_cycle(load_accounts(), prompt="hi", notify=True, log=_watcher_log)
             except Exception as e:
                 push_event(f"Watcher error: {type(e).__name__}: {e}", "error")
 
-            time.sleep(max(15.0, min(sleep_for, 300.0)))
+            sleep_until_next_cycle(max(15.0, min(sleep_for, 300.0)))
     finally:
         WATCHER_ACTIVE = False
         lock.release()
@@ -106,19 +103,46 @@ def background_adaptive_watcher():
 def get_dashboard_state():
     triggers = load_history().get("triggers", [])
     state = load_state()
+    accounts = load_accounts()
+    usage = get_all_usage(accounts, state)
 
     return {
         "server_time": datetime.now().strftime("%I:%M:%S %p"),
-        "actual": get_actual_usage_summary(),
+        "accounts": [
+            dict(
+                acc.describe(),
+                usage=usage[acc.key],
+                cooldown=int(cooldown_remaining(acc.key, state)),
+                failures=int((state.get(acc.key) or {}).get("consecutive_failures", 0)),
+            )
+            for acc in accounts
+        ],
         "startup_autorun": is_startup_installed(),
         "adaptive_auto_warm": ADAPTIVE_AUTO_WARM_ENABLED,
         "watcher_active": WATCHER_ACTIVE,
-        "cooldowns": {t: int(cooldown_remaining(t, state)) for t in ("claude", "codex")},
-        "failures": {t: int((state.get(t) or {}).get("consecutive_failures", 0)) for t in ("claude", "codex")},
         "triggers_count": len(triggers),
         "recent_triggers": list(reversed(triggers[-8:])),
         "events": list(EVENT_LOG),
     }
+
+
+def check_all_logins():
+    """Free login status for every account, probed in parallel."""
+    accounts = load_accounts()
+    statuses = {}
+    threads = [
+        threading.Thread(target=lambda a=acc: statuses.__setitem__(a.key, account_login_status(a)), daemon=True)
+        for acc in accounts
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [
+        dict(statuses.get(acc.key) or {}, key=acc.key, label=acc.label,
+             summary=describe_login(statuses.get(acc.key) or {}))
+        for acc in accounts
+    ]
 
 
 
@@ -210,30 +234,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/api/trigger":
-            target = payload.get("target", "all")
-            if target not in ("all", "claude", "codex"):
-                self.send_json({"error": "Invalid target."}, status=400)
-                return
             prompt = str(payload.get("prompt") or "hi")[:2000]
-            push_event(f"Manual warm-up requested for {target.upper()}.", "info")
-            results = run_trigger_batch(target=target, prompt=prompt, notify=True, quiet=True)
-            for name, res in results.items():
+            if payload.get("account"):
+                acc = find_account(str(payload.get("account")))
+                if acc is None:
+                    self.send_json({"error": "Unknown account."}, status=400)
+                    return
+                target, accounts, what = acc.key, [acc], acc.label
+            else:
+                target = payload.get("target", "all")
+                if target not in ("all", "claude", "codex"):
+                    self.send_json({"error": "Invalid target."}, status=400)
+                    return
+                accounts, what = select_accounts(target), target.upper()
+            push_event(f"Manual warm-up requested for {what}.", "info")
+            results = run_trigger_batch(target=target, prompt=prompt, notify=True, quiet=True, accounts=accounts)
+            labels = {a.key: a.label for a in accounts}
+            for key, res in results.items():
                 push_event(
-                    f"{name.upper()}: {'SUCCESS in ' + str(res.get('duration')) + 's' if res.get('success') else 'FAILED - ' + str(res.get('error'))[:160]}",
+                    f"{labels.get(key, key)}: {'SUCCESS in ' + str(res.get('duration')) + 's' if res.get('success') else 'FAILED - ' + str(res.get('error'))[:160]}",
                     "success" if res.get("success") else "error",
                 )
             self.send_json({
                 "success": any(r.get("success") for r in results.values()),
-                "results": results,
+                "results": [dict(res, key=key, label=labels.get(key, key)) for key, res in results.items()],
                 "state": get_dashboard_state(),
             })
             return
 
         if path == "/api/check-login":
-            push_event("Login check running (sends one real prompt per tool).", "warn")
-            codex_res = trigger_codex("hi", timeout=60)
-            claude_res = trigger_claude("hi", timeout=60)
-            self.send_json({"codex": codex_res, "claude": claude_res, "state": get_dashboard_state()})
+            push_event("Login check running (free - asks each CLI who it is signed in as).", "info")
+            self.send_json({"logins": check_all_logins(), "state": get_dashboard_state()})
             return
 
         if path == "/api/toggle-startup":
@@ -387,15 +418,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       gap: 6px;
     }
 
-    /* Dual Hero Cards for Actual Usage */
-    .dual-cards {
+    /* One Hero Card per Account */
+    .account-cards {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 20px;
     }
 
     @media (max-width: 860px) {
-      .dual-cards { grid-template-columns: 1fr; }
+      .account-cards { grid-template-columns: 1fr; }
+    }
+
+    .empty-state {
+      display: none;
+      background: var(--bg-card);
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 22px;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    .empty-state code {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-main);
     }
 
     .card {
@@ -694,110 +740,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </header>
 
-    <!-- Dual Live Actual Usage Cards -->
-    <div class="dual-cards">
-      <!-- Claude Code Card -->
-      <div class="card claude-card">
-        <div class="card-header">
-          <div class="tool-brand">
-            <div class="tool-avatar">🟣</div>
-            <div class="tool-title">
-              <h2>Claude Code</h2>
-              <span id="claudeModels">Models: Checking...</span>
-            </div>
-          </div>
-          <div class="status-badge idle" id="claudeBadge">
-            <span class="pulse-dot"></span> <span id="claudeBadgeText">IDLE</span>
-          </div>
-        </div>
-
-        <div class="timer-center">
-          <div class="digits" id="claudeTimer">--:--:--</div>
-          <div class="sub" id="claudeSub">Detecting actual 5h window from ~/.claude...</div>
-        </div>
-
-        <div class="progress-container">
-          <div class="progress-fill" id="claudeProgress" style="width: 0%;"></div>
-        </div>
-
-        <div class="metrics-grid">
-          <div class="metric-cell">
-            <span>5H WINDOW START</span>
-            <strong id="claudeStart">N/A</strong>
-          </div>
-          <div class="metric-cell">
-            <span>FULL QUOTA RESETS AT</span>
-            <strong id="claudeReset">N/A</strong>
-          </div>
-          <div class="metric-cell">
-            <span>USER PROMPTS IN 5H</span>
-            <strong id="claudePrompts">0 prompts</strong>
-          </div>
-          <div class="metric-cell">
-            <span>TOTAL TOKENS USED</span>
-            <strong id="claudeTokens">0</strong>
-          </div>
-        </div>
-
-        <button class="btn btn-claude" id="btnClaudeWarm" onclick="triggerSingle('claude')">
-          <span>🟣 Warm Up Claude Limit</span>
-        </button>
-      </div>
-
-      <!-- OpenAI Codex Card -->
-      <div class="card codex-card">
-        <div class="card-header">
-          <div class="tool-brand">
-            <div class="tool-avatar">🤖</div>
-            <div class="tool-title">
-              <h2>OpenAI Codex CLI</h2>
-              <span>gpt-5.4-mini · AppData Executable</span>
-            </div>
-          </div>
-          <div class="status-badge idle" id="codexBadge">
-            <span class="pulse-dot"></span> <span id="codexBadgeText">IDLE</span>
-          </div>
-        </div>
-
-        <div class="timer-center">
-          <div class="digits" id="codexTimer">--:--:--</div>
-          <div class="sub" id="codexSub">Detecting actual 5h window from ~/.codex...</div>
-        </div>
-
-        <div class="progress-container">
-          <div class="progress-fill" id="codexProgress" style="width: 0%;"></div>
-        </div>
-
-        <div class="metrics-grid">
-          <div class="metric-cell">
-            <span>5H WINDOW START</span>
-            <strong id="codexStart">N/A</strong>
-          </div>
-          <div class="metric-cell">
-            <span>FULL QUOTA RESETS AT</span>
-            <strong id="codexReset">N/A</strong>
-          </div>
-          <div class="metric-cell">
-            <span>TURNS IN 5H</span>
-            <strong id="codexTurns">0 turns</strong>
-          </div>
-          <div class="metric-cell">
-            <span>TOKENS IN SESSION</span>
-            <strong id="codexTokens">0</strong>
-          </div>
-        </div>
-
-        <button class="btn btn-codex" id="btnCodexWarm" onclick="triggerSingle('codex')">
-          <span>🤖 Warm Up Codex Limit</span>
-        </button>
-      </div>
+    <!-- One Live Usage Card per Account (built by buildCards) -->
+    <div class="account-cards" id="accountCards"></div>
+    <div class="empty-state" id="noAccounts">
+      No accounts configured. Add one from a terminal with
+      <code>python quota_warmer.py --add-account claude work</code>
+      (or <code>codex</code>), then refresh.
     </div>
 
     <!-- Global Action & Unattended Controls -->
     <div class="control-bar">
       <div class="control-left">
-        <button class="btn btn-primary" id="btnWarmAll" onclick="triggerSingle('all')">
-          <span>🔥 Warm Up Both Now</span>
+        <button class="btn btn-primary" id="btnWarmAll" onclick="trigger({ target: 'all' }, 'ALL ACCOUNTS')">
+          <span>🔥 Warm Up All Now</span>
         </button>
 
         <div class="switch-wrap">
@@ -829,16 +784,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- Live Console Output -->
     <div class="console-card" id="consoleOutput">
-      <div class="console-line info">[System] Actual 5-Hour Limit Detector active. Monitoring ~/.claude and ~/.codex.</div>
+      <div class="console-line info">[System] Actual 5-Hour Limit Detector active. Monitoring every configured account.</div>
     </div>
   </div>
 
   <script>
     const CSRF_TOKEN = '__CSRF_TOKEN__';
-    let claudeRemainingSec = 0;
-    let codexRemainingSec = 0;
+    const cards = new Map();      // account key -> card element
+    const remaining = {};         // account key -> seconds left, ticked locally between polls
+    let cardKeys = null;
     let busy = false;
     let lastEventKey = '';
+
+    // Static skeleton only - account names, paths and readings go in through
+    // textContent so nothing from disk is ever parsed as HTML.
+    const CARD_HTML = `
+      <div class="card-header">
+        <div class="tool-brand">
+          <div class="tool-avatar"></div>
+          <div class="tool-title"><h2 class="acc-label"></h2><span class="acc-sub"></span></div>
+        </div>
+        <div class="status-badge idle"><span class="pulse-dot"></span> <span class="badge-text">IDLE</span></div>
+      </div>
+      <div class="timer-center">
+        <div class="digits">--:--:--</div>
+        <div class="sub">Detecting actual 5h window...</div>
+      </div>
+      <div class="progress-container"><div class="progress-fill" style="width: 0%;"></div></div>
+      <div class="metrics-grid">
+        <div class="metric-cell"><span>5H WINDOW START</span><strong class="m-start">N/A</strong></div>
+        <div class="metric-cell"><span>FULL QUOTA RESETS AT</span><strong class="m-reset">N/A</strong></div>
+        <div class="metric-cell"><span class="m-count-label"></span><strong class="m-count">0</strong></div>
+        <div class="metric-cell"><span class="m-tokens-label"></span><strong class="m-tokens">0</strong></div>
+      </div>
+      <button class="btn warm-btn"></button>`;
 
     function log(msg, type = 'info') {
       const con = document.getElementById('consoleOutput');
@@ -863,10 +842,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     function setBusy(state) {
       busy = state;
-      ['btnWarmAll', 'btnClaudeWarm', 'btnCodexWarm'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.disabled = state;
-      });
+      document.getElementById('btnWarmAll').disabled = state;
+      document.querySelectorAll('.warm-btn').forEach(el => { el.disabled = state; });
     }
 
     function fmt(sec) {
@@ -883,16 +860,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
-    function renderCard(p, d, cooldown, failures) {
-      const badge = document.getElementById(p + 'Badge');
-      badge.className = `status-badge ${String(d.status || 'idle').toLowerCase()}`;
-      document.getElementById(p + 'BadgeText').textContent = d.status;
-      document.getElementById(p + 'Timer').textContent = d.time_remaining;
-      document.getElementById(p + 'Progress').style.width = (d.progress_pct || 0) + '%';
-      document.getElementById(p + 'Start').textContent = d.window_start;
-      document.getElementById(p + 'Reset').textContent = d.window_reset;
-      document.getElementById(p + 'Tokens').textContent = (d.tokens?.total || 0).toLocaleString();
+    function buildCards(accounts) {
+      const wrap = document.getElementById('accountCards');
+      wrap.textContent = '';
+      cards.clear();
+      for (const acc of accounts) {
+        const isClaude = acc.tool === 'claude';
+        const card = document.createElement('div');
+        card.className = `card ${isClaude ? 'claude-card' : 'codex-card'}`;
+        card.innerHTML = CARD_HTML;
+        card.querySelector('.tool-avatar').textContent = isClaude ? '🟣' : '🤖';
+        card.querySelector('.acc-label').textContent = acc.label;
+        card.querySelector('.m-count-label').textContent = isClaude ? 'USER PROMPTS IN 5H' : 'TURNS IN 5H';
+        card.querySelector('.m-tokens-label').textContent = isClaude ? 'TOTAL TOKENS USED' : 'TOKENS IN SESSION';
+        const btn = card.querySelector('.warm-btn');
+        btn.classList.add(isClaude ? 'btn-claude' : 'btn-codex');
+        btn.textContent = `${isClaude ? '🟣' : '🤖'} Warm Up ${acc.label}`;
+        btn.disabled = busy;
+        btn.addEventListener('click', () => trigger({ account: acc.key }, acc.label));
+        wrap.appendChild(card);
+        cards.set(acc.key, card);
+      }
+      for (const key of Object.keys(remaining)) {
+        if (!cards.has(key)) delete remaining[key];
+      }
+      document.getElementById('noAccounts').style.display = accounts.length ? 'none' : 'block';
+    }
 
+    function renderCard(acc) {
+      const card = cards.get(acc.key);
+      if (!card) return;
+      const d = acc.usage || {};
+      const q = sel => card.querySelector(sel);
+      q('.status-badge').className = `status-badge ${String(d.status || 'idle').toLowerCase()}`;
+      q('.badge-text').textContent = d.status || 'IDLE';
+      q('.digits').textContent = d.time_remaining || '--:--:--';
+      q('.progress-fill').style.width = (d.progress_pct || 0) + '%';
+      q('.m-start').textContent = d.window_start || 'N/A';
+      q('.m-reset').textContent = d.window_reset || 'N/A';
+      q('.m-tokens').textContent = (d.tokens?.total || 0).toLocaleString();
+      q('.m-count').textContent = acc.tool === 'claude'
+        ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
+        : `${d.turns_in_5h || 0} turns`;
+      const extra = acc.tool === 'claude'
+        ? (d.models_used?.length ? ' · ' + d.models_used.join(', ') : '')
+        : (d.plan_type ? ' · ' + d.plan_type : '');
+      q('.acc-sub').textContent = acc.dir + extra;
+      q('.sub').textContent = subText(d, acc.cooldown || 0, acc.failures || 0);
+      remaining[acc.key] = d.is_active ? (d.remaining_seconds || 0) : 0;
+    }
+
+    function subText(d, cooldown, failures) {
       let sub;
       if (d.status === 'ERROR') {
         sub = 'Detector error: ' + (d.error || 'unknown');
@@ -907,7 +925,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       } else {
         sub = 'Window reset. Ready for next warmup.';
       }
-      document.getElementById(p + 'Sub').textContent = sub;
+      return sub;
     }
 
     function updateUI(data) {
@@ -917,23 +935,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('watcherState').textContent =
         data.watcher_active ? '(watching)' : '(handled by background daemon)';
 
-      const cl = data.actual?.claude, cx = data.actual?.codex;
-
-      if (cl) {
-        claudeRemainingSec = cl.remaining_seconds || 0;
-        renderCard('claude', cl, data.cooldowns?.claude || 0, data.failures?.claude || 0);
-        document.getElementById('claudePrompts').textContent =
-          `${cl.user_prompts} prompts (${cl.total_events} events)`;
-        if (cl.models_used?.length) {
-          document.getElementById('claudeModels').textContent = 'Models: ' + cl.models_used.join(', ');
-        }
+      // Rebuild only when the account list changes (e.g. one was added from the CLI).
+      const accounts = data.accounts || [];
+      const keys = accounts.map(a => a.key).join('|');
+      if (keys !== cardKeys) {
+        buildCards(accounts);
+        cardKeys = keys;
       }
-
-      if (cx) {
-        codexRemainingSec = cx.remaining_seconds || 0;
-        renderCard('codex', cx, data.cooldowns?.codex || 0, data.failures?.codex || 0);
-        document.getElementById('codexTurns').textContent = `${cx.turns_in_5h} turns`;
-      }
+      accounts.forEach(renderCard);
 
       // Mirror events the server-side watcher produced while nobody was looking.
       const events = data.events || [];
@@ -947,14 +956,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
-    async function triggerSingle(target) {
+    async function trigger(body, label) {
       if (busy) return;
       setBusy(true);
-      log(`Triggering warmup for [${target.toUpperCase()}]... this can take up to a minute.`, 'info');
+      log(`Triggering warmup for [${label}]... this can take up to a minute.`, 'info');
       try {
-        const data = await post('/api/trigger', { target, prompt: 'hi' });
-        for (const [name, r] of Object.entries(data.results || {})) {
-          log(`${name.toUpperCase()}: ${r.success ? 'SUCCESS (' + r.duration + 's)' : 'FAILED: ' + r.error}`,
+        const data = await post('/api/trigger', { ...body, prompt: 'hi' });
+        for (const r of data.results || []) {
+          log(`${r.label}: ${r.success ? 'SUCCESS (' + r.duration + 's)' : 'FAILED: ' + r.error}`,
               r.success ? 'success' : 'error');
         }
         if (data.state) updateUI(data.state);
@@ -969,11 +978,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     async function checkLogins() {
       if (busy) return;
       setBusy(true);
-      log('Testing logins (sends one real prompt to each tool)...', 'warn');
+      log('Checking logins (free - asks each CLI who it is signed in as, no prompt is sent)...', 'info');
       try {
         const data = await post('/api/check-login', {});
-        log(`Codex: ${data.codex?.success ? 'AUTHENTICATED' : data.codex?.error}`, data.codex?.success ? 'success' : 'error');
-        log(`Claude: ${data.claude?.success ? 'AUTHENTICATED' : data.claude?.error}`, data.claude?.success ? 'success' : 'error');
+        for (const l of data.logins || []) {
+          log(`${l.label}: ${l.summary}`, l.logged_in ? 'success' : (l.logged_in === false ? 'error' : 'warn'));
+          if (l.warning) log(`${l.label}: ${l.warning}`, 'warn');
+        }
+        if (!(data.logins || []).length) log('No accounts configured.', 'warn');
       } catch (err) {
         log('Check login error: ' + err.message, 'error');
       } finally {
@@ -1016,11 +1028,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     // Local 1s countdown between server polls.
     setInterval(() => {
-      if (claudeRemainingSec > 0) {
-        document.getElementById('claudeTimer').textContent = fmt(--claudeRemainingSec);
-      }
-      if (codexRemainingSec > 0) {
-        document.getElementById('codexTimer').textContent = fmt(--codexRemainingSec);
+      for (const [key, sec] of Object.entries(remaining)) {
+        if (sec <= 0) continue;
+        remaining[key] = sec - 1;
+        const card = cards.get(key);
+        if (card) card.querySelector('.digits').textContent = fmt(sec - 1);
       }
     }, 1000);
 
