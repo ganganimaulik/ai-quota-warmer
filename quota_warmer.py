@@ -1045,7 +1045,7 @@ def login_account(account, claude_path=None, codex_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Background sign-in (driven by the dashboard and the desktop app)
+# Background sign-in (driven by the web dashboard)
 # ---------------------------------------------------------------------------
 
 LOGIN_TIMEOUT_SEC = 900

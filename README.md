@@ -21,13 +21,13 @@ python quota_warmer.py --status
 | 4. Keep it warm 24/7 | `python quota_warmer.py --install-startup` | `enable_autorun_on_restart.bat` |
 | 5. *(Optional)* Add another account | `python quota_warmer.py --add-account claude work` | `add_account.bat` |
 
-Then optionally open a UI:
+Then optionally open the web dashboard:
 
 ```bash
 python app_ui.py
 ```
 
-*(`open_ui.bat` for the web dashboard at http://127.0.0.1:5055, `open_desktop_gui.bat` for the native app.)*
+*(Or double-click `open_ui.bat` for the web dashboard at http://127.0.0.1:5055.)*
 
 ---
 
@@ -39,9 +39,8 @@ second folder, so the warmer runs the official CLI once per account with that va
 set. It never reads or stores your credentials. The CLI's own browser login writes them
 into the folder.
 
-**From the dashboard or desktop app:** click **➕ Add Account**, pick the tool, name the
-account and sign in. Each card also has **Sign in again** and **Remove** (in the desktop
-app they're under **⋯**).
+**From the web dashboard:** click **➕ Add Account**, pick the tool, name the
+account and sign in. Each card also has **Sign in again** and **Remove**.
 
 **From a terminal** (or double-click `add_account.bat`):
 
@@ -158,7 +157,6 @@ Safety rails on both:
 | `quota_warmer.py` | Main engine: triggers, adaptive watcher, autorun/task install, history |
 | `usage_detector.py` | Read-only 5-hour window + token/quota detector, per account folder |
 | `app_ui.py` | Local web dashboard (http://127.0.0.1:5055) |
-| `gui_app.py` | Native Tkinter desktop app |
 | `install_task.ps1` | PowerShell task installer (logon + interval triggers; may need admin) |
 | `_env.bat` | Shared helper that locates a working Python for the other `.bat` files |
 | `trigger_now.bat` | Warm every account now |
