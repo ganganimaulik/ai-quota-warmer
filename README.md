@@ -39,20 +39,34 @@ second folder, so the warmer runs the official CLI once per account with that va
 set. It never reads or stores your credentials. The CLI's own browser login writes them
 into the folder.
 
+**From the dashboard or desktop app:** click **➕ Add Account**, pick the tool, name the
+account and sign in. Each card also has **Sign in again** and **Remove** (in the desktop
+app they're under **⋯**).
+
+**From a terminal** (or double-click `add_account.bat`):
+
 ```bash
 python quota_warmer.py --add-account claude work      # creates ~/.claude-work, opens the browser login
 python quota_warmer.py --add-account codex personal   # creates ~/.codex-personal
 python quota_warmer.py --list-accounts                # who each account is signed in as (free)
 ```
 
+**Signing in with a second account.** The sign-in opens your default browser, which is
+probably still signed in to your first account. Close that tab and copy the sign-in link
+(shown in the UI, or printed in the terminal) into a private/incognito window. Then sign
+in there with the account you want. Codex finishes on its own. Claude shows a code at the
+end: paste it into the UI's code field, or into the terminal's
+`Paste code here if prompted >` prompt.
+
+- An account is only added once its sign-in succeeds, so the watcher never tries to warm
+  an account that is still signing in.
 - Your existing logins stay as the **default** `claude` and `codex` accounts, so
   single-account setups need no changes.
 - Each account has its own window detection, cooldown, backoff and history, and all
   accounts warm in parallel. A running watcher or dashboard picks up a new account within
   about 15 seconds.
-- **Sign in with the right account.** If the browser is already signed in to your other
-  account, switch accounts first. Otherwise both folders get the same login.
-  `--list-accounts` shows each account's email and warns when two look identical.
+- `--list-accounts` (or **🔍 Check Logins**) shows each account's email and warns when two
+  look identical.
 - For added accounts, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`,
   `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` are removed from the environment. Credentials in
   the environment override the folder's login and would make every account warm the same one.
@@ -217,7 +231,7 @@ in your browser could POST to the local API and install scheduled tasks or burn 
 | :--- | :--- |
 | `'python' is not recognized` | Install Python 3.9+ with "Add python.exe to PATH" ticked |
 | Claude warm-ups fail | Run `setup_claude_login.bat` once (added accounts: `python quota_warmer.py --login claude:NAME`) |
-| Two accounts show the same email | The browser reused an existing sign-in. Sign out of claude.ai / chatgpt.com (or use a private window), then `--login` the account again |
+| Two accounts show the same email | The browser reused an existing sign-in. Use **Sign in again** on that account (or `--login`) and open the sign-in link in a private/incognito window |
 | `--list-accounts` warns "An API key is configured" | `ANTHROPIC_API_KEY` or an `apiKeyHelper` is set, so warm-ups may be billed to the API instead of starting the subscription window. Unset it |
 | Codex account fails with "CODEX_HOME ... does not exist" | Its folder was deleted. Run `--remove-account` and then `--add-account` again |
 | `--status` shows `EXPIRED` right after a successful warm-up | Session logs can lag a second or two; re-run `--status` |

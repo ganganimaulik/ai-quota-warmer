@@ -23,6 +23,11 @@ from quota_warmer import (
     load_accounts,
     find_account,
     select_accounts,
+    prepare_account,
+    remove_account,
+    start_login_job,
+    current_login_job,
+    dismiss_login_job,
     cooldown_remaining,
     get_all_usage,
     run_trigger_batch,
@@ -123,6 +128,7 @@ def get_dashboard_state():
         "triggers_count": len(triggers),
         "recent_triggers": list(reversed(triggers[-8:])),
         "events": list(EVENT_LOG),
+        "login_job": current_login_job().snapshot() if current_login_job() else None,
     }
 
 
@@ -203,6 +209,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(get_dashboard_state())
             return
 
+        if path == "/api/login-job":
+            job = current_login_job()
+            self.send_json({"job": job.snapshot() if job else None})
+            return
+
         if path in ("/", "/index.html"):
             page = HTML_TEMPLATE.replace("__CSRF_TOKEN__", CSRF_TOKEN).encode("utf-8")
             self.send_response(200)
@@ -265,6 +276,67 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/check-login":
             push_event("Login check running (free - asks each CLI who it is signed in as).", "info")
             self.send_json({"logins": check_all_logins(), "state": get_dashboard_state()})
+            return
+
+        # -- account management: the CLI's own sign-in, run in the background --
+
+        if path == "/api/accounts/add":
+            try:
+                # The folder is always the default ~/.claude-NAME / ~/.codex-NAME;
+                # custom folders stay a CLI option (--dir).
+                acc = prepare_account(str(payload.get("tool") or ""), str(payload.get("name") or "").strip())
+                job = start_login_job(acc, register=True)
+            except (ValueError, OSError) as e:
+                self.send_json({"error": str(e)}, status=400)
+                return
+            self.send_json({"job": job.snapshot()})
+            return
+
+        if path == "/api/accounts/login":
+            acc = find_account(str(payload.get("account") or ""))
+            if acc is None:
+                self.send_json({"error": "Unknown account."}, status=400)
+                return
+            try:
+                job = start_login_job(acc, register=False)
+            except ValueError as e:
+                self.send_json({"error": str(e)}, status=400)
+                return
+            self.send_json({"job": job.snapshot()})
+            return
+
+        if path == "/api/accounts/login/code":
+            job = current_login_job()
+            try:
+                if job is None:
+                    raise ValueError("No sign-in is in progress.")
+                job.submit_code(payload.get("code"))
+            except ValueError as e:
+                self.send_json({"error": str(e)}, status=400)
+                return
+            self.send_json({"job": job.snapshot()})
+            return
+
+        if path == "/api/accounts/login/cancel":
+            job = current_login_job()
+            if job is not None:
+                job.cancel()
+            self.send_json({"job": job.snapshot() if job else None})
+            return
+
+        if path == "/api/accounts/login/dismiss":
+            dismiss_login_job()
+            self.send_json({"job": None})
+            return
+
+        if path == "/api/accounts/remove":
+            try:
+                acc = remove_account(str(payload.get("account") or ""))
+            except ValueError as e:
+                self.send_json({"error": str(e)}, status=400)
+                return
+            push_event(f"Removed {acc.label}. Its folder and login stay in {acc.home}.", "info")
+            self.send_json({"removed": acc.key, "state": get_dashboard_state()})
             return
 
         if path == "/api/toggle-startup":
@@ -721,6 +793,59 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+    /* `hidden` must win over the display rules below. */
+    [hidden] { display: none !important; }
+
+    /* Account panel: add form + live sign-in */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border-highlight);
+      border-radius: var(--radius-lg);
+      padding: 18px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    #addForm, #loginView, #loginRunning, #linkBox, #codeBox { display: flex; flex-direction: column; gap: 8px; }
+    #loginView { gap: 12px; }
+    #loginResult:empty, #loginError:empty, #addError:empty { display: none; }
+    .panel h3 { font-size: 16px; font-weight: 700; }
+    .muted { color: var(--text-muted); font-size: 13px; }
+    .form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    .field {
+      background: var(--bg-card-sub);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      color: var(--text-main);
+      font-family: 'Outfit', sans-serif;
+      font-size: 13px;
+      padding: 7px 10px;
+      outline: none;
+    }
+
+    .field:focus { border-color: var(--border-highlight); }
+    .field.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; flex: 1; min-width: 240px; }
+    a.btn { text-decoration: none; }
+    .form-error { color: var(--accent-rose); font-size: 13px; }
+    .result-ok { color: var(--accent-green); font-size: 14px; }
+    .result-bad { color: var(--accent-rose); font-size: 14px; }
+
+    .card-actions { display: flex; justify-content: flex-end; gap: 14px; margin-top: -6px; }
+
+    .link-btn {
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      color: var(--text-dim);
+      font-family: 'Outfit', sans-serif;
+      font-size: 12px;
+    }
+
+    .link-btn:hover { color: var(--text-main); text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -743,9 +868,58 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <!-- One Live Usage Card per Account (built by buildCards) -->
     <div class="account-cards" id="accountCards"></div>
     <div class="empty-state" id="noAccounts">
-      No accounts configured. Add one from a terminal with
-      <code>python quota_warmer.py --add-account claude work</code>
-      (or <code>codex</code>), then refresh.
+      No accounts configured yet. Use <strong>➕ Add Account</strong> below, or run
+      <code>python quota_warmer.py --add-account claude work</code> in a terminal.
+    </div>
+
+    <!-- Account panel: the add form, then the live sign-in (hidden until used) -->
+    <div class="panel" id="accountPanel" hidden>
+      <div id="addForm">
+        <h3>Add an account</h3>
+        <p class="muted">Signs in through the tool's own browser login and keeps it in a folder of
+          its own (~/.claude-NAME or ~/.codex-NAME). The account shows up here once the sign-in finishes.</p>
+        <div class="form-row">
+          <select class="field" id="addTool">
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex</option>
+          </select>
+          <input class="field" id="addName" maxlength="32" placeholder="Name, e.g. personal2"
+                 autocomplete="off" onkeydown="if (event.key === 'Enter') submitAdd()">
+          <button class="btn btn-primary btn-sm" id="btnAddSubmit" onclick="submitAdd()">Add &amp; Sign In</button>
+          <button class="btn btn-secondary btn-sm" onclick="closePanel()">Cancel</button>
+        </div>
+        <div class="form-error" id="addError"></div>
+      </div>
+
+      <div id="loginView" hidden>
+        <h3 id="loginTitle">Signing in…</h3>
+        <div id="loginRunning">
+          <p class="muted">A browser tab should have opened. Finish the sign-in there.</p>
+          <div id="linkBox" hidden>
+            <p class="muted">Is that browser signed in to a different account? Copy this link into a
+              private/incognito window and sign in there with the account you want:</p>
+            <div class="form-row">
+              <input class="field mono" id="loginUrl" readonly>
+              <button class="btn btn-secondary btn-sm" onclick="copyLoginUrl()">Copy</button>
+              <a class="btn btn-secondary btn-sm" id="loginOpen" target="_blank" rel="noopener noreferrer">Open</a>
+            </div>
+          </div>
+          <div id="codeBox" hidden>
+            <p class="muted">Signed in through the link? Claude then shows a code. Paste it here:</p>
+            <div class="form-row">
+              <input class="field mono" id="loginCode" placeholder="Paste the code" autocomplete="off"
+                     onkeydown="if (event.key === 'Enter') submitCode()">
+              <button class="btn btn-primary btn-sm" onclick="submitCode()">Submit code</button>
+            </div>
+          </div>
+        </div>
+        <p id="loginResult"></p>
+        <div class="form-error" id="loginError"></div>
+        <div class="form-row">
+          <button class="btn btn-secondary btn-sm" id="btnLoginCancel" onclick="cancelLogin()">Cancel sign-in</button>
+          <button class="btn btn-secondary btn-sm" id="btnLoginClose" onclick="closePanel()" hidden>Close</button>
+        </div>
+      </div>
     </div>
 
     <!-- Global Action & Unattended Controls -->
@@ -773,6 +947,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div style="display: flex; gap: 8px;">
+        <button class="btn btn-secondary btn-sm" onclick="openAddForm()">
+          ➕ Add Account
+        </button>
         <button class="btn btn-secondary btn-sm" onclick="scheduleTask('interval', 5)">
           ⏱️ Run Every 5h (Task Scheduler)
         </button>
@@ -817,7 +994,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="metric-cell"><span class="m-count-label"></span><strong class="m-count">0</strong></div>
         <div class="metric-cell"><span class="m-tokens-label"></span><strong class="m-tokens">0</strong></div>
       </div>
-      <button class="btn warm-btn"></button>`;
+      <button class="btn warm-btn"></button>
+      <div class="card-actions">
+        <button class="link-btn relogin-btn">Sign in again</button>
+        <button class="link-btn remove-btn">Remove</button>
+      </div>`;
 
     function log(msg, type = 'info') {
       const con = document.getElementById('consoleOutput');
@@ -878,6 +1059,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         btn.textContent = `${isClaude ? '🟣' : '🤖'} Warm Up ${acc.label}`;
         btn.disabled = busy;
         btn.addEventListener('click', () => trigger({ account: acc.key }, acc.label));
+        card.querySelector('.relogin-btn').addEventListener('click', () => relogin(acc.key, acc.label));
+        card.querySelector('.remove-btn').addEventListener('click', () => removeAccount(acc.key, acc.label, acc.dir));
         wrap.appendChild(card);
         cards.set(acc.key, card);
       }
@@ -943,6 +1126,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         cardKeys = keys;
       }
       accounts.forEach(renderCard);
+
+      // A sign-in in progress (e.g. started in another tab, or before a reload).
+      const job = data.login_job;
+      if (job && (job.active || (currentJob && currentJob.started_at === job.started_at))) {
+        showLoginJob(job);
+      }
 
       // Mirror events the server-side watcher produced while nobody was looking.
       const events = data.events || [];
@@ -1024,6 +1213,161 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         log('Schedule error: ' + err.message, 'error');
       }
       fetchStatus();
+    }
+
+    // -- Accounts: add, sign in again, remove ------------------------------
+
+    let currentJob = null;    // the sign-in shown in the panel
+    let loginPoll = null;
+    let loggedOutcome = '';   // job whose result is already in the console
+
+    function openAddForm() {
+      if (currentJob && currentJob.active) { showLoginJob(currentJob); return; }
+      document.getElementById('accountPanel').hidden = false;
+      document.getElementById('addForm').hidden = false;
+      document.getElementById('loginView').hidden = true;
+      document.getElementById('addError').textContent = '';
+      document.getElementById('addName').focus();
+    }
+
+    function closePanel() {
+      if (currentJob && !currentJob.active) post('/api/accounts/login/dismiss', {}).catch(() => {});
+      currentJob = null;
+      stopLoginPoll();
+      document.getElementById('accountPanel').hidden = true;
+    }
+
+    async function submitAdd() {
+      const tool = document.getElementById('addTool').value;
+      const name = document.getElementById('addName').value.trim();
+      const err = document.getElementById('addError');
+      err.textContent = '';
+      if (!name) { err.textContent = 'Give the account a name, e.g. personal2.'; return; }
+      try {
+        const data = await post('/api/accounts/add', { tool, name });
+        document.getElementById('addName').value = '';
+        log(`Signing in new account ${data.job.label}...`, 'info');
+        showLoginJob(data.job);
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    }
+
+    async function relogin(key, label) {
+      try {
+        const data = await post('/api/accounts/login', { account: key });
+        log(`Signing in ${label} again...`, 'info');
+        showLoginJob(data.job);
+      } catch (e) {
+        log('Sign-in error: ' + e.message, 'error');
+      }
+    }
+
+    async function removeAccount(key, label, dir) {
+      if (!confirm(`Stop warming ${label}?\n\nIts folder and login stay in ${dir}, so you can add it back later.`)) return;
+      try {
+        const data = await post('/api/accounts/remove', { account: key });
+        log(`Removed ${label}.`, 'info');
+        if (data.state) updateUI(data.state);
+      } catch (e) {
+        log('Remove error: ' + e.message, 'error');
+      }
+    }
+
+    function showLoginJob(job) {
+      if (!currentJob || currentJob.started_at !== job.started_at) {
+        document.getElementById('loginError').textContent = '';
+        document.getElementById('loginCode').value = '';
+      }
+      currentJob = job;
+      renderLoginJob(job);
+      if (job.active) startLoginPoll();
+    }
+
+    function startLoginPoll() {
+      if (loginPoll) return;
+      loginPoll = setInterval(async () => {
+        try {
+          const res = await fetch('/api/login-job', { cache: 'no-store' });
+          const data = await res.json();
+          if (!data.job) { stopLoginPoll(); return; }
+          currentJob = data.job;
+          renderLoginJob(data.job);
+          if (!data.job.active) { stopLoginPoll(); fetchStatus(); }
+        } catch (err) { /* transient - keep polling */ }
+      }, 1200);
+    }
+
+    function stopLoginPoll() {
+      if (loginPoll) { clearInterval(loginPoll); loginPoll = null; }
+    }
+
+    function renderLoginJob(job) {
+      document.getElementById('accountPanel').hidden = false;
+      document.getElementById('addForm').hidden = true;
+      document.getElementById('loginView').hidden = false;
+      const verb = { starting: 'Starting sign-in for', running: 'Signing in', succeeded: 'Signed in',
+                     failed: 'Sign-in failed for', cancelled: 'Sign-in cancelled for' }[job.state] || 'Signing in';
+      document.getElementById('loginTitle').textContent = `${verb} ${job.label}`;
+      // While "starting" the CLI has not opened the browser yet.
+      document.getElementById('loginRunning').hidden = job.state !== 'running';
+
+      // Only ever link to https - the URL is text a CLI printed.
+      const url = (job.url && /^https:\/\//.test(job.url)) ? job.url : '';
+      document.getElementById('linkBox').hidden = !url;
+      document.getElementById('codeBox').hidden = !(url && job.accepts_code);
+      if (url) {
+        document.getElementById('loginUrl').value = url;
+        document.getElementById('loginOpen').href = url;
+      }
+
+      const result = document.getElementById('loginResult');
+      result.className = job.state === 'succeeded' ? 'result-ok' : 'result-bad';
+      result.textContent = job.active ? '' : job.state === 'succeeded'
+        ? `✅ ${job.detail}${job.register ? ' — added, and it will be warmed within seconds.' : ''}`
+        : `❌ ${job.detail || 'The sign-in did not complete.'}`;
+      document.getElementById('btnLoginCancel').hidden = !job.active;
+      document.getElementById('btnLoginClose').hidden = job.active;
+
+      const id = job.key + '@' + job.started_at;
+      if (!job.active && loggedOutcome !== id) {
+        loggedOutcome = id;
+        log(`${job.label}: ${job.detail}`, job.state === 'succeeded' ? 'success' : 'error');
+      }
+    }
+
+    async function submitCode() {
+      const input = document.getElementById('loginCode');
+      const err = document.getElementById('loginError');
+      err.textContent = '';
+      if (!input.value.trim()) { err.textContent = 'Paste the code from the Claude page first.'; return; }
+      try {
+        const data = await post('/api/accounts/login/code', { code: input.value.trim() });
+        input.value = '';
+        showLoginJob(data.job);
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    }
+
+    async function cancelLogin() {
+      try {
+        const data = await post('/api/accounts/login/cancel', {});
+        if (data.job) showLoginJob(data.job);
+      } catch (e) {
+        log('Cancel error: ' + e.message, 'error');
+      }
+    }
+
+    async function copyLoginUrl() {
+      const input = document.getElementById('loginUrl');
+      try {
+        await navigator.clipboard.writeText(input.value);
+      } catch (err) {
+        input.select();
+        document.execCommand('copy');
+      }
+      log('Sign-in link copied - paste it into a private/incognito window.', 'info');
     }
 
     // Local 1s countdown between server polls.

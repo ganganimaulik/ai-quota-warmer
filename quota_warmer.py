@@ -28,11 +28,13 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 # Paths & Defaults
@@ -157,6 +159,22 @@ def record_attempt(key: str, success: bool, window=None):
             entry["window"] = dict(window, as_of=now_t)
         save_state(state)
         return entry
+
+
+def clear_backoff(key: str):
+    """
+    Forgets failed warm attempts, e.g. after the account was signed in again,
+    so the watcher retries on its next pass instead of waiting out a backoff
+    earned while the login was broken.
+    """
+    with _FILE_LOCK:
+        state = load_state()
+        entry = state.get(key)
+        if not entry or not int(entry.get("consecutive_failures", 0) or 0):
+            return
+        entry["consecutive_failures"] = 0
+        entry["last_attempt"] = 0.0
+        save_state(state)
 
 
 def cooldown_remaining(key: str, state=None) -> float:
@@ -413,24 +431,30 @@ def select_accounts(target="all", specs=None, accounts=None):
     return [a for a in accounts if target in ("all", a.tool)]
 
 
-def add_account(tool, name, config_dir=None):
+def _check_new_account(acc, accounts):
+    if find_account(acc.key, accounts):
+        raise ValueError(f"Account '{acc.tool}:{acc.name}' already exists.")
+    for other in accounts:
+        if other.tool == acc.tool and _norm_dir(other.home) == _norm_dir(acc.home):
+            raise ValueError(f"{other.label} already uses {other.home}.")
+
+
+def prepare_account(tool, name, config_dir=None):
     """
-    Registers a new account and creates its directory.
+    Validates a new account and creates its directory, without registering it.
 
     Without `config_dir` the account lives in ~/.claude-NAME or ~/.codex-NAME,
     which is also where you would point CLAUDE_CONFIG_DIR / CODEX_HOME to use
     the same login interactively. The name "default" restores the CLI's
-    standard location.
+    standard location. Register it with register_account() once it is signed
+    in: a registered account that is not logged in yet would be picked up by
+    the watcher, fail to warm and land in backoff mid-login.
     """
     tool = str(tool).lower()
     if tool not in TOOLS:
         raise ValueError(f"Unknown tool '{tool}'. Use one of: {', '.join(TOOLS)}")
     if not _ACCOUNT_NAME_RE.match(name or ""):
         raise ValueError("Account names are 1-32 characters: letters, digits, '.', '_' or '-'.")
-
-    accounts = load_accounts()
-    if find_account(f"{tool}:{name}", accounts):
-        raise ValueError(f"Account '{tool}:{name}' already exists.")
 
     if name.lower() == DEFAULT_ACCOUNT:
         if config_dir:
@@ -441,15 +465,25 @@ def add_account(tool, name, config_dir=None):
         target_dir = config_dir or (Path.home() / f".{tool}-{name}")
         acc = Account(tool, name, os.path.abspath(os.path.expanduser(str(target_dir))))
 
-    for other in accounts:
-        if other.tool == tool and _norm_dir(other.home) == _norm_dir(acc.home):
-            raise ValueError(f"{other.label} already uses {other.home}.")
-
+    _check_new_account(acc, load_accounts())
     # Codex refuses to start at all when CODEX_HOME does not exist yet.
     acc.home.mkdir(parents=True, exist_ok=True)
-    accounts.append(acc)
-    save_accounts(accounts)
     return acc
+
+
+def register_account(acc):
+    """Adds a prepared account to accounts.json, re-checking for clashes first."""
+    with _FILE_LOCK:
+        accounts = load_accounts()
+        _check_new_account(acc, accounts)
+        accounts.append(acc)
+        save_accounts(accounts)
+    return acc
+
+
+def add_account(tool, name, config_dir=None):
+    """Prepares and registers an account in one step (no sign-in)."""
+    return register_account(prepare_account(tool, name, config_dir))
 
 
 def remove_account(spec):
@@ -966,6 +1000,19 @@ def _claude_login_cmd(claude_bin, env):
     return [claude_bin, "/login"]
 
 
+def _login_command(account, claude_path=None, codex_path=None):
+    """The CLI's own login command for this account, as (cmd, None) or (None, reason)."""
+    if account.tool == "claude":
+        binary = find_claude_binary(claude_path)
+        if not binary:
+            return None, "Claude Code CLI not found - install it first."
+        return _claude_login_cmd(binary, account.env()), None
+    binary = find_codex_binary(codex_path)
+    if not binary:
+        return None, "Codex CLI not found - install it first."
+    return [binary, "login"], None
+
+
 def login_account(account, claude_path=None, codex_path=None):
     """
     Runs the CLI's own interactive login with this account's directory selected.
@@ -974,29 +1021,246 @@ def login_account(account, claude_path=None, codex_path=None):
     this tool never sees the credentials.
     """
     account.home.mkdir(parents=True, exist_ok=True)
-    env = account.env()
-    if account.tool == "claude":
-        binary = find_claude_binary(claude_path)
-        cmd = _claude_login_cmd(binary, env) if binary else None
-    else:
-        binary = find_codex_binary(codex_path)
-        cmd = [binary, "login"] if binary else None
+    cmd, problem = _login_command(account, claude_path, codex_path)
     if not cmd:
-        print(f"[-] {TOOL_TITLES[account.tool]} CLI not found - install it first.")
+        print(f"[-] {problem}")
         return False
 
-    print(f"[*] Opening the {account.label} login for {account.home}")
-    print("    Finish it in your browser. Sign in with the account you want here -")
-    print("    if a browser session is already signed in, switch accounts first.")
+    print(f"[*] Opening the {account.label} sign-in for {account.home}")
+    print("    Your browser opens on its own. To sign in with a different account than")
+    print("    the one it is already signed in to, copy the link printed below into a")
+    if account.tool == "claude":
+        print("    private/incognito window instead, then paste the code it shows here.")
+    else:
+        print("    private/incognito window instead.")
     if cmd[-1] == "/login":
         print("    Close the Claude session (/exit) once it says you are logged in.")
     try:
         # Inherits this console so the CLI can show its prompts and URL.
-        rc = subprocess.call(cmd, env=env)
+        rc = subprocess.call(cmd, env=account.env())
     except OSError as e:
         print(f"[-] Could not start the login: {e}")
         return False
     return rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Background sign-in (driven by the dashboard and the desktop app)
+# ---------------------------------------------------------------------------
+
+LOGIN_TIMEOUT_SEC = 900
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_SIGNIN_URL_RE = re.compile(r"https://\S*authorize\S*")
+_PASTE_PROMPT = "Paste code here if prompted >"
+
+
+def _kill_tree(proc):
+    """Stops a CLI and whatever it spawned: npm wrappers run the real binary as a child."""
+    if proc.poll() is not None:
+        return
+    try:
+        if _IS_WINDOWS:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True,
+                           timeout=15, creationflags=_NO_WINDOW)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+class LoginJob:
+    """
+    One account's CLI sign-in, run in the background so a UI can drive it.
+
+    The CLI still opens the default browser itself. The job also captures the
+    sign-in link the CLI prints: opening that link in a private window is the
+    easy way to sign in with a different account than the one the browser is
+    already signed in to. Codex's link completes on its own through its local
+    callback; Claude's ends on a page showing a code, which submit_code()
+    passes to the waiting CLI. With `register`, the account is added to
+    accounts.json only once the sign-in succeeded.
+    """
+
+    def __init__(self, account, register=False, claude_path=None, codex_path=None):
+        self.account = account
+        self.register = register
+        self._paths = (claude_path, codex_path)
+        self._lock = threading.Lock()
+        self._proc = None
+        self.state = "starting"          # -> running -> succeeded | failed | cancelled
+        self.url = None
+        self.detail = ""
+        self.login = None
+        self.output = deque(maxlen=30)
+        self.started_at = time.time()
+        self.finished_at = None
+
+    @property
+    def active(self):
+        return self.state in ("starting", "running")
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def snapshot(self):
+        """Thread-safe, JSON-friendly view for the UIs."""
+        with self._lock:
+            return {
+                "key": self.account.key, "label": self.account.label, "tool": self.account.tool,
+                "dir": _display_path(self.account.home), "register": self.register,
+                "state": self.state, "active": self.active, "url": self.url,
+                "accepts_code": self.account.tool == "claude", "detail": self.detail,
+                "login": self.login, "output": list(self.output),
+                "started_at": self.started_at, "finished_at": self.finished_at,
+            }
+
+    def submit_code(self, code):
+        """Hands the code from Claude's sign-in page to the waiting CLI."""
+        code = str(code or "").strip()
+        if not code or len(code) > 4000 or any(c in code for c in "\r\n\x00"):
+            raise ValueError("That doesn't look like a sign-in code.")
+        with self._lock:
+            proc = self._proc if self.state == "running" else None
+        if proc is None or self.account.tool != "claude":
+            raise ValueError("No sign-in is waiting for a code.")
+        try:
+            proc.stdin.write(code + "\n")
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            raise ValueError("The sign-in is no longer accepting a code.")
+
+    def cancel(self):
+        with self._lock:
+            if not self.active:
+                return False
+            self.state, self.detail, self.finished_at = "cancelled", "Sign-in cancelled.", time.time()
+            proc = self._proc
+        if proc is not None:
+            _kill_tree(proc)
+        return True
+
+    def _end(self, state, detail, login=None):
+        with self._lock:
+            if self.state == "cancelled":
+                return
+            self.state, self.detail, self.login, self.finished_at = state, detail, login, time.time()
+
+    def _run(self):
+        acc = self.account
+        try:
+            acc.home.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return self._end("failed", f"Could not create {acc.home}: {e}")
+        if self.register:
+            # Re-adding a removed account: its folder still holds a valid login.
+            status = account_login_status(acc, *self._paths)
+            if status.get("logged_in") is True:
+                with self._lock:
+                    if self.state == "cancelled":
+                        return
+                try:
+                    register_account(acc)
+                except ValueError as e:
+                    return self._end("failed", str(e), status)
+                return self._end("succeeded", f"Already {describe_login(status)}", status)
+        cmd, problem = _login_command(acc, *self._paths)
+        if not cmd:
+            return self._end("failed", problem)
+        if cmd[-1] == "/login":
+            return self._end("failed", "This Claude Code has no 'claude auth login' - update it "
+                                       "('claude update') or use add_account.bat.")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", env=acc.env(),
+                creationflags=_NO_WINDOW, start_new_session=not _IS_WINDOWS,
+            )
+        except (OSError, ValueError) as e:
+            return self._end("failed", f"Could not start the sign-in: {e}")
+        with self._lock:
+            cancelled = self.state == "cancelled"
+            if not cancelled:
+                self._proc, self.state = proc, "running"
+        if cancelled:
+            return _kill_tree(proc)
+
+        reader = threading.Thread(target=self._read, args=(proc,), daemon=True)
+        reader.start()
+        try:
+            rc = proc.wait(timeout=LOGIN_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            rc = None
+        # The CLI's last words (often the error) may still be in the pipe.
+        reader.join(timeout=5)
+        self._finish(rc)
+
+    def _read(self, proc):
+        try:
+            for raw in proc.stdout:
+                line = _ANSI_RE.sub("", raw).replace(_PASTE_PROMPT, "").strip()
+                if not line:
+                    continue
+                with self._lock:
+                    self.output.append(line)
+                    match = _SIGNIN_URL_RE.search(line)
+                    if match and self.url is None:
+                        self.url = match.group(0)
+        except (OSError, ValueError):
+            pass
+
+    def _finish(self, rc):
+        with self._lock:
+            if self.state == "cancelled":
+                return
+        status = account_login_status(self.account, *self._paths)
+        # An unknown status (old CLI) falls back to trusting the exit code.
+        if status.get("logged_in") is True or (status.get("logged_in") is None and rc == 0):
+            if self.register:
+                try:
+                    register_account(self.account)
+                except ValueError as e:
+                    return self._end("failed", str(e), status)
+            clear_backoff(self.account.key)
+            return self._end("succeeded", describe_login(status), status)
+        if rc is None:
+            reason = "Timed out waiting for the sign-in to finish."
+        else:
+            with self._lock:
+                last = next((l for l in reversed(self.output) if not _SIGNIN_URL_RE.search(l)), "")
+            reason = last or "The sign-in did not complete."
+        self._end("failed", reason, status)
+
+
+_LOGIN_JOB = None
+_LOGIN_JOB_LOCK = threading.Lock()
+
+
+def start_login_job(account, register=False, claude_path=None, codex_path=None):
+    """Starts a background sign-in; one at a time, since Codex's callback port is fixed."""
+    global _LOGIN_JOB
+    with _LOGIN_JOB_LOCK:
+        if _LOGIN_JOB is not None and _LOGIN_JOB.active:
+            raise ValueError(f"A sign-in for {_LOGIN_JOB.account.label} is already in progress.")
+        _LOGIN_JOB = LoginJob(account, register, claude_path, codex_path).start()
+        return _LOGIN_JOB
+
+
+def current_login_job():
+    return _LOGIN_JOB
+
+
+def dismiss_login_job():
+    """Forgets a finished sign-in so the UIs stop showing it."""
+    global _LOGIN_JOB
+    with _LOGIN_JOB_LOCK:
+        if _LOGIN_JOB is not None and not _LOGIN_JOB.active:
+            _LOGIN_JOB = None
 
 
 def check_logins(codex_path=None, claude_path=None, accounts=None):
@@ -1525,27 +1789,31 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
     return max(15.0, min(sleep_for, 300.0))
 
 
-def _accounts_stamp():
-    try:
-        return ACCOUNTS_FILE.stat().st_mtime_ns
-    except OSError:
-        return None
+def _watch_stamp():
+    stamps = []
+    for path in (ACCOUNTS_FILE, STATE_FILE):
+        try:
+            stamps.append(path.stat().st_mtime_ns)
+        except OSError:
+            stamps.append(None)
+    return tuple(stamps)
 
 
 def sleep_until_next_cycle(seconds, step=15.0):
     """
-    Sleeps between watcher passes, but wakes early when accounts.json changes,
-    so an account added with --add-account is warmed within seconds rather
-    than after the current (up to 5 minute) sleep.
+    Sleeps between watcher passes, but wakes early when accounts.json or
+    state.json changes: an account added, removed or signed in again from
+    another window is acted on within seconds rather than after the current
+    (up to 5 minute) sleep.
     """
-    stamp = _accounts_stamp()
+    stamp = _watch_stamp()
     deadline = time.time() + seconds
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
             return
         time.sleep(min(step, remaining))
-        if _accounts_stamp() != stamp:
+        if _watch_stamp() != stamp:
             return
 
 
@@ -1673,6 +1941,8 @@ def main():
             sys.exit(1)
         login_account(acc, args.claude_path, args.codex_path)
         status = account_login_status(acc, args.claude_path, args.codex_path)
+        if status.get("logged_in"):
+            clear_backoff(acc.key)
         print(f"[{'+' if status.get('logged_in') else '-'}] {acc.label}: {describe_login(status)}")
         return
 
@@ -1736,11 +2006,11 @@ def main():
 def _cli_add_account(args):
     tool, name = args.add_account
     try:
-        acc = add_account(tool, name, args.dir)
+        acc = prepare_account(tool, name, args.dir)
     except (ValueError, OSError) as e:
         print(f"[-] {e}")
         sys.exit(1)
-    print(f"[+] Added {acc.label} as '{acc.key}' -> {acc.home}")
+    print(f"[*] Setting up {acc.label} as '{acc.key}' in {acc.home}")
 
     status = account_login_status(acc, args.claude_path, args.codex_path)
     if not status.get("logged_in"):
@@ -1749,8 +2019,18 @@ def _cli_add_account(args):
     print(f"    Login  : {describe_login(status)}")
     if status.get("warning"):
         print(f"    Warning: {status['warning']}")
-    if not status.get("logged_in"):
-        print(f"    Finish it later with: python quota_warmer.py --login {acc.key}")
+    # Registering a signed-out account would only make the watcher fail on it.
+    if status.get("logged_in") is False:
+        retry = f"python quota_warmer.py --add-account {acc.tool} {acc.name}"
+        print("[-] The sign-in did not complete, so the account was not added.")
+        print(f"    Try again with: {retry}" + (f' --dir "{acc.home}"' if args.dir else ""))
+        sys.exit(1)
+    try:
+        register_account(acc)
+    except ValueError as e:
+        print(f"[-] {e}")
+        sys.exit(1)
+    print(f"[+] Added {acc.label} as '{acc.key}'.")
     print("    A running watcher starts warming it within ~15 seconds - no restart needed.")
     if not acc.is_default:
         var = _HOME_ENV[acc.tool]
