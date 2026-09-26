@@ -8,7 +8,11 @@ Reads real usage telemetry directly from local session logs:
                      plus ~/.codex/thread_history_1.sqlite for turn counts.
 - Claude Code      : ~/.claude/projects/**/*.jsonl (session transcripts; Claude
                      does not persist its rate-limit headers locally, so the
-                     5-hour window is inferred by clustering activity).
+                     5-hour window is inferred by clustering activity - unless
+                     the caller passes the exact window a warm-up reported).
+
+Every reader takes the account's directory (CLAUDE_CONFIG_DIR / CODEX_HOME),
+so each account is measured from its own logs.
 
 Design notes
 ------------
@@ -49,6 +53,18 @@ _CLI_LOCK = threading.Lock()
 _FILE_CACHE = {}
 _FILE_CACHE_LOCK = threading.Lock()
 _FILE_CACHE_MAX = 4000
+
+
+def claude_home(config_dir=None) -> Path:
+    """The Claude Code config directory: explicit, else $CLAUDE_CONFIG_DIR, else ~/.claude."""
+    chosen = config_dir or os.getenv("CLAUDE_CONFIG_DIR")
+    return Path(chosen).expanduser() if chosen else Path.home() / ".claude"
+
+
+def codex_home(home=None) -> Path:
+    """The Codex home directory: explicit, else $CODEX_HOME, else ~/.codex."""
+    chosen = home or os.getenv("CODEX_HOME")
+    return Path(chosen).expanduser() if chosen else Path.home() / ".codex"
 
 
 def _as_aware(dt):
@@ -365,20 +381,39 @@ def _extract_claude_event(obj):
     return (ts, ev_type, model, usage)
 
 
-def get_claude_actual_usage():
-    """
-    Detects the Claude Code 5-hour rolling window by clustering session activity.
+def _exact_reset(exact, now_utc):
+    """The reset time of a CLI-reported window ({"resets_at": epoch}), if usable."""
+    if not isinstance(exact, dict):
+        return None
+    try:
+        reset = datetime.fromtimestamp(float(exact.get("resets_at")), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    # A 5-hour window cannot end more than five hours out, and a reset older than
+    # the lookback no longer anchors anything.
+    if not (now_utc - timedelta(hours=LOOKBACK_HOURS) <= reset
+            <= now_utc + timedelta(hours=CLAUDE_WINDOW_HOURS, minutes=15)):
+        return None
+    return reset
 
-    Claude does not persist rate-limit headers locally, so the window is inferred:
-    it opens at the first message after the previous window lapsed and runs for
-    five hours.
+
+def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
+    """
+    Detects the Claude Code 5-hour rolling window of one config directory.
+
+    `exact` is the window Claude Code itself reported for the last warm-up
+    ({"resets_at": epoch}, taken from its rate_limit_event). While that reset
+    is ahead it is used as-is. Once it has passed it anchors the clustering:
+    the next window opens at the first message after it. Without it the window
+    is inferred from transcripts alone - it opens at the first message after
+    the previous window lapsed and runs for five hours.
     """
     now_utc = datetime.now(timezone.utc)
     now_local = datetime.now().astimezone()
     cutoff = now_utc - timedelta(hours=LOOKBACK_HOURS)
     cutoff_ts = cutoff.timestamp() - 3600
 
-    pattern = str(Path.home() / ".claude" / "projects" / "**" / "*.jsonl")
+    pattern = str(claude_home(config_dir) / "projects" / "**" / "*.jsonl")
 
     all_events = []
     for path in _iter_recent_files(pattern, cutoff_ts):
@@ -387,19 +422,33 @@ def get_claude_actual_usage():
                 all_events.append(rec)
 
     all_events.sort(key=lambda r: r[0])
-    windows = _cluster_windows([(r[0], r) for r in all_events], CLAUDE_WINDOW_HOURS)
 
-    live_cli = fetch_live_claude_cli()
+    exact_reset = _exact_reset(exact, now_utc)
+    cluster_events = all_events
+    if exact_reset is not None and exact_reset <= now_utc:
+        # Everything up to the known reset belonged to the window that closed.
+        cluster_events = [r for r in all_events if r[0] > exact_reset]
+    windows = _cluster_windows([(r[0], r) for r in cluster_events], CLAUDE_WINDOW_HOURS)
+
+    live_cli = fetch_live_claude_cli() if allow_live_cli else None
 
     last_window = windows[-1] if windows else None
     active_window = last_window if (last_window and now_utc < last_window[1]) else None
 
     # Prefer an explicit reset time from the CLI when one is available and sane.
+    source = "session-logs"
     if live_cli and live_cli.get("session_reset_dt"):
         reset_dt_local = live_cli["session_reset_dt"]
         start_dt_local = reset_dt_local - timedelta(hours=CLAUDE_WINDOW_HOURS)
         remaining_sec = max(0, int((reset_dt_local - now_local).total_seconds()))
         is_active = remaining_sec > 0
+        source = "cli"
+    elif exact_reset is not None and exact_reset > now_utc:
+        reset_dt_local = exact_reset.astimezone()
+        start_dt_local = reset_dt_local - timedelta(hours=CLAUDE_WINDOW_HOURS)
+        remaining_sec = max(0, int((exact_reset - now_utc).total_seconds()))
+        is_active = remaining_sec > 0
+        source = "rate-limit-event"
     elif active_window:
         start_dt_local = active_window[0].astimezone()
         reset_dt_local = active_window[1].astimezone()
@@ -410,12 +459,23 @@ def get_claude_actual_usage():
         reset_dt_local = last_window[1].astimezone()
         remaining_sec = 0
         is_active = False
+    elif exact_reset is not None:
+        # The reported window closed and nothing has happened since.
+        reset_dt_local = exact_reset.astimezone()
+        start_dt_local = reset_dt_local - timedelta(hours=CLAUDE_WINDOW_HOURS)
+        remaining_sec = 0
+        is_active = False
+        source = "rate-limit-event"
     else:
         start_dt_local = reset_dt_local = None
         remaining_sec = 0
         is_active = False
 
-    window_events = active_window[2] if active_window else (last_window[2] if last_window else [])
+    if source != "session-logs":
+        start_utc, end_utc = start_dt_local.astimezone(timezone.utc), reset_dt_local.astimezone(timezone.utc)
+        window_events = [(r[0], r) for r in all_events if start_utc <= r[0] <= end_utc]
+    else:
+        window_events = active_window[2] if active_window else (last_window[2] if last_window else [])
 
     user_prompts = 0
     total_input = total_output = total_cache_read = total_cache_write = 0
@@ -443,10 +503,10 @@ def get_claude_actual_usage():
 
     return {
         "tool": "claude",
-        "has_data": bool(all_events) or live_cli is not None,
+        "has_data": bool(all_events) or live_cli is not None or exact_reset is not None,
         "is_active": is_active,
-        "status": "ACTIVE" if is_active else ("EXPIRED" if last_window else "IDLE"),
-        "source": "cli" if (live_cli and live_cli.get("session_reset_dt")) else "session-logs",
+        "status": "ACTIVE" if is_active else ("EXPIRED" if (last_window or exact_reset) else "IDLE"),
+        "source": source,
         "window_start": _fmt_local(start_dt_local),
         "window_reset": _fmt_local(reset_dt_local),
         "reset_epoch": reset_dt_local.timestamp() if reset_dt_local else None,
@@ -499,9 +559,9 @@ def _extract_codex_event(obj):
     return (ts, obj.get("type"), payload_type, rate_limits, total_tokens, is_turn)
 
 
-def _read_codex_sqlite_turns(cutoff_ts):
+def _read_codex_sqlite_turns(cutoff_ts, home=None):
     """Reads turn start times from Codex's thread history DB (read-only)."""
-    db_path = Path.home() / ".codex" / "thread_history_1.sqlite"
+    db_path = codex_home(home) / "thread_history_1.sqlite"
     if not db_path.exists():
         return []
 
@@ -543,9 +603,9 @@ def _latest_codex_rate_limits(events):
     return None, None
 
 
-def get_codex_actual_usage():
+def get_codex_actual_usage(home=None):
     """
-    Reports the Codex 5-hour rolling window.
+    Reports the Codex 5-hour rolling window of one CODEX_HOME.
 
     Codex writes authoritative limit data into its session logs
     (`rate_limits.primary` = {used_percent, window_minutes, resets_at}), so that
@@ -555,7 +615,7 @@ def get_codex_actual_usage():
     cutoff = now_utc - timedelta(hours=LOOKBACK_HOURS)
     cutoff_ts = cutoff.timestamp() - 3600
 
-    pattern = str(Path.home() / ".codex" / "sessions" / "**" / "*.jsonl")
+    pattern = str(codex_home(home) / "sessions" / "**" / "*.jsonl")
 
     all_events = []
     for path in _iter_recent_files(pattern, cutoff_ts):
@@ -565,7 +625,7 @@ def get_codex_actual_usage():
 
     all_events.sort(key=lambda r: r[0])
 
-    sqlite_turns = _read_codex_sqlite_turns(cutoff_ts)
+    sqlite_turns = _read_codex_sqlite_turns(cutoff_ts, home)
     combined = [(r[0], r) for r in all_events] + [
         (dt, (dt, "thread_turn", None, None, 0, True)) for dt in sqlite_turns if dt >= cutoff
     ]
@@ -649,8 +709,21 @@ def get_codex_actual_usage():
     }
 
 
+def get_account_usage(tool, home=None, exact=None, allow_live_cli=True):
+    """
+    The 5-hour window of one account directory. Never raises: a failed read
+    comes back as an ERROR reading, which callers treat as "do not warm".
+    """
+    try:
+        if tool == "claude":
+            return get_claude_actual_usage(home, exact=exact, allow_live_cli=allow_live_cli)
+        return get_codex_actual_usage(home)
+    except Exception as e:  # never let a telemetry read crash a caller's UI loop
+        return _error_state(tool, e)
+
+
 def get_actual_usage_summary():
-    """Returns the combined actual 5-hour limit usage for both Codex and Claude Code."""
+    """Returns the combined actual 5-hour limit usage for the default Codex and Claude Code accounts."""
     try:
         claude = get_claude_actual_usage()
     except Exception as e:  # never let a telemetry read crash a caller's UI loop
@@ -691,4 +764,7 @@ def _error_state(tool, exc):
 
 
 if __name__ == "__main__":
-    print(json.dumps(get_actual_usage_summary(), indent=2))
+    # Every configured account, the same readings the warmer acts on.
+    from quota_warmer import get_all_usage
+
+    print(json.dumps(get_all_usage(), indent=2, default=str))
