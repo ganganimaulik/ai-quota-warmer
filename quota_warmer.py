@@ -45,8 +45,20 @@ STATE_FILE = DATA_DIR / "state.json"
 LOCK_FILE = DATA_DIR / "daemon.lock"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 DEFAULT_PROMPT = "hi"
+DEFAULT_CLAUDE_MODEL = os.getenv("AQW_CLAUDE_MODEL", "haiku")
+DEFAULT_CODEX_MODEL = os.getenv("AQW_CODEX_MODEL", "luna")
 QUOTA_WINDOW_HOURS = 5.0
 TASK_NAME = "AIQuotaWarmer_5HourLimit"
+
+
+def _normalize_codex_model(model: str) -> str:
+    """Normalizes 'luna' to its canonical Codex CLI slug 'gpt-5.6-luna'."""
+    if not model:
+        return model
+    m = str(model).strip()
+    if m.lower() in ("luna", "gpt-luna"):
+        return "gpt-5.6-luna"
+    return m
 
 # Retry policy for the adaptive watcher.
 BASE_COOLDOWN_SEC = 300          # minimum gap between warm attempts per tool
@@ -682,7 +694,7 @@ def _add_login_hint(res, account):
     return res
 
 
-def trigger_codex(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=None):
+def trigger_codex(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=None, model=DEFAULT_CODEX_MODEL):
     """Runs codex non-interactively to trigger the quota window of one account."""
     account = account or Account("codex")
     codex_bin = find_codex_binary(custom_path)
@@ -701,9 +713,11 @@ def trigger_codex(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=N
         "exec",
         "--skip-git-repo-check",
         "--sandbox", "read-only",
-        "--",
-        prompt,
     ]
+    resolved_model = _normalize_codex_model(model)
+    if resolved_model:
+        cmd.extend(["-m", resolved_model])
+    cmd.extend(["--", prompt])
     res = _run_cli(account.key, cmd, codex_bin, timeout, env=account.env())
     return _add_login_hint(res, account)
 
@@ -773,7 +787,7 @@ def _parse_claude_stream(stdout):
     return text, None, extra
 
 
-def trigger_claude(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=None):
+def trigger_claude(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=None, model=DEFAULT_CLAUDE_MODEL):
     """Runs claude code non-interactively to trigger the quota window of one account."""
     account = account or Account("claude")
     claude_bin = find_claude_binary(custom_path)
@@ -786,7 +800,10 @@ def trigger_claude(prompt=DEFAULT_PROMPT, custom_path=None, timeout=90, account=
 
     # stream-json (which needs --verbose alongside -p) is what exposes the
     # rate_limit_event messages; the request sent is the same as plain -p.
-    args = ["-p", prompt, "--output-format", "stream-json", "--verbose"]
+    args = []
+    if model:
+        args.extend(["--model", str(model)])
+    args.extend(["-p", prompt, "--output-format", "stream-json", "--verbose"])
     if _is_npx(claude_bin):
         cmd = [claude_bin, "-y", "@anthropic-ai/claude-code"] + args
         # The first npx run downloads the package; give it room.
@@ -1302,11 +1319,14 @@ def check_logins(codex_path=None, claude_path=None, accounts=None):
     return results
 
 
-def trigger_account(account, prompt=DEFAULT_PROMPT, codex_path=None, claude_path=None, timeout=90):
+def trigger_account(account, prompt=DEFAULT_PROMPT, codex_path=None, claude_path=None, timeout=90,
+                    claude_model=None, codex_model=None):
     """Sends one warm-up prompt through the CLI of `account`."""
     if account.tool == "claude":
-        return trigger_claude(prompt, claude_path, timeout=timeout, account=account)
-    return trigger_codex(prompt, codex_path, timeout=timeout, account=account)
+        m = DEFAULT_CLAUDE_MODEL if claude_model is None else claude_model
+        return trigger_claude(prompt, claude_path, timeout=timeout, account=account, model=m)
+    m = DEFAULT_CODEX_MODEL if codex_model is None else codex_model
+    return trigger_codex(prompt, codex_path, timeout=timeout, account=account, model=m)
 
 
 def _fmt_epoch(epoch):
@@ -1314,12 +1334,15 @@ def _fmt_epoch(epoch):
 
 
 def run_trigger_batch(target="all", prompt=DEFAULT_PROMPT, codex_path=None, claude_path=None,
-                      notify=True, quiet=False, accounts=None):
+                      notify=True, quiet=False, accounts=None, claude_model=None, codex_model=None):
     """Executes triggers concurrently for `accounts` (default: every account matching `target`)."""
     accounts = select_accounts(target) if accounts is None else accounts
     now = datetime.datetime.now()
     reset_at = now + datetime.timedelta(hours=QUOTA_WINDOW_HOURS)
     lines = []
+
+    c_model = DEFAULT_CLAUDE_MODEL if claude_model is None else claude_model
+    x_model = _normalize_codex_model(DEFAULT_CODEX_MODEL if codex_model is None else codex_model)
 
     def out(msg):
         lines.append(msg)
@@ -1332,6 +1355,8 @@ def run_trigger_batch(target="all", prompt=DEFAULT_PROMPT, codex_path=None, clau
     out(f"  Trigger Time   : {now.strftime('%Y-%m-%d %I:%M:%S %p')}")
     out(f"  Est. Reset At  : {reset_at.strftime('%Y-%m-%d %I:%M:%S %p')} (+{int(QUOTA_WINDOW_HOURS)}h 00m)")
     out(f"  Prompt Message : '{prompt}'")
+    out(f"  Claude Model   : '{c_model or '(CLI default)'}'")
+    out(f"  Codex Model    : '{x_model or '(CLI default)'}'")
     out(f"  Account(s)     : {', '.join(a.key for a in accounts) or 'none'}")
     out("-" * 60)
 
@@ -1347,7 +1372,10 @@ def run_trigger_batch(target="all", prompt=DEFAULT_PROMPT, codex_path=None, clau
     with _TRIGGER_LOCK:
         threads = [
             threading.Thread(
-                target=lambda a=acc: results.__setitem__(a.key, trigger_account(a, prompt, codex_path, claude_path)),
+                target=lambda a=acc: results.__setitem__(
+                    a.key, trigger_account(a, prompt, codex_path, claude_path,
+                                           claude_model=c_model, codex_model=x_model)
+                ),
                 daemon=True,
             )
             for acc in accounts
@@ -1392,6 +1420,7 @@ def run_trigger_batch(target="all", prompt=DEFAULT_PROMPT, codex_path=None, clau
         "timestamp": now.isoformat(),
         "reset_at": reset_at.isoformat(),
         "prompt": prompt,
+        "models": {"claude": c_model, "codex": x_model},
         "target": target,
         "results": results,
         "any_success": any_success,
@@ -1707,7 +1736,8 @@ def _print_backoff(key, state):
 # Adaptive watcher
 # ---------------------------------------------------------------------------
 
-def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=print):
+def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=print,
+                    claude_model=None, codex_model=None):
     """
     Warms one account if its window has lapsed and its cooldown has elapsed.
 
@@ -1727,7 +1757,7 @@ def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=prin
         return False
 
     log(f"[{datetime.datetime.now():%I:%M:%S %p}] {account.label} 5h window expired -> warming...")
-    res = trigger_account(account, prompt)
+    res = trigger_account(account, prompt, claude_model=claude_model, codex_model=codex_model)
     entry = record_attempt(account.key, bool(res.get("success")), window=res.get("window"))
 
     if res.get("success"):
@@ -1751,7 +1781,8 @@ def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=prin
     return True
 
 
-def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sleep=60.0):
+def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sleep=60.0,
+               claude_model=None, codex_model=None):
     """
     One pass of the adaptive watcher: warms every account whose window has
     lapsed (in parallel, so the last of several accounts is not left waiting)
@@ -1765,7 +1796,8 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
            if not usage[a.key].get("is_active") and usage[a.key].get("status") != "ERROR"]
     threads = [
         threading.Thread(target=warm_if_expired, args=(a, usage[a.key]),
-                         kwargs={"prompt": prompt, "notify": notify, "log": log}, daemon=True)
+                         kwargs={"prompt": prompt, "notify": notify, "log": log,
+                                 "claude_model": claude_model, "codex_model": codex_model}, daemon=True)
         for a in due
     ]
     for t in threads:
@@ -1818,7 +1850,8 @@ def sleep_until_next_cycle(seconds, step=15.0):
 
 
 def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAULT_PROMPT,
-                               notify=True, verbose=True, account_specs=None):
+                               notify=True, verbose=True, account_specs=None,
+                               claude_model=None, codex_model=None):
     """
     Watches the real 5-hour window of every account and warms each one the
     moment it resets.
@@ -1831,12 +1864,15 @@ def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAU
             print(msg, flush=True)
 
     accounts = select_accounts(target, account_specs)
+    c_model = DEFAULT_CLAUDE_MODEL if claude_model is None else claude_model
+    x_model = _normalize_codex_model(DEFAULT_CODEX_MODEL if codex_model is None else codex_model)
 
     log("=" * 70)
     log("  AI QUOTA WARMER - SMART ADAPTIVE AUTO-WARM DAEMON")
     log("=" * 70)
     log(f"  Watching: {', '.join(a.label for a in accounts) or 'no accounts yet'}")
     log(f"  Prompt  : '{prompt}'")
+    log(f"  Models  : Claude='{c_model}', Codex='{x_model}'")
     log("  Warm-up fires as soon as an account's 5-hour window resets.")
     log("  Press Ctrl+C to stop.")
     log("=" * 70 + "\n")
@@ -1860,7 +1896,8 @@ def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAU
                     watching = [a.key for a in accounts]
                     log(f"[*] Now watching: {', '.join(a.label for a in accounts) or 'no accounts'}")
                 sleep_for = warm_cycle(accounts, prompt=prompt, notify=notify, log=log,
-                                       idle_sleep=check_interval_sec)
+                                       idle_sleep=check_interval_sec,
+                                       claude_model=c_model, codex_model=x_model)
             except Exception as e:
                 log(f"  [!] Watcher error: {type(e).__name__}: {e}")
                 sleep_for = float(check_interval_sec)
@@ -1872,9 +1909,11 @@ def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAU
         lock.release()
 
 
-def run_daemon_loop(interval_hours=5.0, target="all", prompt=DEFAULT_PROMPT, notify=True):
+def run_daemon_loop(interval_hours=5.0, target="all", prompt=DEFAULT_PROMPT, notify=True,
+                    claude_model=None, codex_model=None):
     """Runs the continuous smart adaptive auto-warmup monitor."""
-    run_smart_adaptive_monitor(target=target, prompt=prompt, notify=notify, verbose=True)
+    run_smart_adaptive_monitor(target=target, prompt=prompt, notify=notify, verbose=True,
+                               claude_model=claude_model, codex_model=codex_model)
 
 
 # ---------------------------------------------------------------------------
@@ -1894,6 +1933,10 @@ def main():
                         help="Limit to specific account(s): claude, codex, claude:NAME, codex:NAME "
                              "(repeatable or comma-separated)")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help=f"Prompt to send (default: '{DEFAULT_PROMPT}')")
+    parser.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL,
+                        help=f"Model for Claude Code warmup (default: '{DEFAULT_CLAUDE_MODEL}')")
+    parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL,
+                        help=f"Model for Codex warmup (default: '{DEFAULT_CODEX_MODEL}')")
     parser.add_argument("--status", action="store_true", help="Show the real 5-hour window countdown and history")
     parser.add_argument("--check-login", "--list-accounts", dest="check_login", action="store_true",
                         help="List accounts and who each is logged in as (free - no prompt is sent)")
@@ -1977,7 +2020,8 @@ def main():
         return
     if args.loop:
         run_smart_adaptive_monitor(target=args.target, prompt=args.prompt, notify=not args.no_notify,
-                                   account_specs=args.account)
+                                   account_specs=args.account,
+                                   claude_model=args.claude_model, codex_model=args.codex_model)
         return
 
     # Default action: warm now. Respects the backoff unless --force is given, so
@@ -2000,6 +2044,8 @@ def main():
         claude_path=args.claude_path,
         notify=not args.no_notify,
         accounts=selected,
+        claude_model=args.claude_model,
+        codex_model=args.codex_model,
     )
 
 

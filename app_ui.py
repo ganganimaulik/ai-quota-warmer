@@ -162,6 +162,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
     # -- guards ------------------------------------------------------------
 
     def _host_ok(self) -> bool:
@@ -259,7 +265,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 accounts, what = select_accounts(target), target.upper()
             push_event(f"Manual warm-up requested for {what}.", "info")
-            results = run_trigger_batch(target=target, prompt=prompt, notify=True, quiet=True, accounts=accounts)
+            results = run_trigger_batch(
+                target=target,
+                prompt=prompt,
+                notify=True,
+                quiet=True,
+                accounts=accounts,
+                claude_model=payload.get("claude_model"),
+                codex_model=payload.get("codex_model"),
+            )
             labels = {a.key: a.label for a in accounts}
             for key, res in results.items():
                 push_event(
@@ -1423,9 +1437,14 @@ def run_server():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nDashboard server stopped.")
+    except Exception as e:
+        print(f"\nDashboard server error: {type(e).__name__}: {e}")
     finally:
-        httpd.shutdown()
-        httpd.server_close()
+        try:
+            httpd.shutdown()
+            httpd.server_close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
