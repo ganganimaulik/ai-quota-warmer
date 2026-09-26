@@ -170,6 +170,11 @@ def record_attempt(key: str, success: bool, window=None):
         if window:
             entry["window"] = dict(window, as_of=now_t)
         save_state(state)
+        try:
+            from usage_detector import invalidate_usage_cache
+            invalidate_usage_cache()
+        except ImportError:
+            pass
         return entry
 
 
@@ -187,6 +192,11 @@ def clear_backoff(key: str):
         entry["consecutive_failures"] = 0
         entry["last_attempt"] = 0.0
         save_state(state)
+        try:
+            from usage_detector import invalidate_usage_cache
+            invalidate_usage_cache()
+        except ImportError:
+            pass
 
 
 def cooldown_remaining(key: str, state=None) -> float:
@@ -1622,14 +1632,17 @@ def uninstall_scheduled_task():
 # Status reporting
 # ---------------------------------------------------------------------------
 
-def get_all_usage(accounts=None, state=None):
+def get_all_usage(accounts=None, state=None, force=False):
     """
     Local 5-hour window readings for every account, keyed by Account.key.
 
     Claude readings are anchored on the exact reset the last warm-up reported
     (kept in state.json), so they stop being guesses once a warm-up has run.
     """
-    from usage_detector import get_account_usage
+    from usage_detector import get_account_usage, invalidate_usage_cache
+
+    if force:
+        invalidate_usage_cache()
 
     accounts = load_accounts() if accounts is None else accounts
     state = load_state() if state is None else state
@@ -1639,6 +1652,7 @@ def get_all_usage(accounts=None, state=None):
             exact=(state.get(acc.key) or {}).get("window"),
             # The opt-in `claude -p /cost` probe is billed; never multiply it per account.
             allow_live_cli=acc.is_default,
+            force=force,
         )
         for acc in accounts
     }

@@ -42,6 +42,7 @@ from quota_warmer import (
     uninstall_scheduled_task,
     SingleInstanceLock,
 )
+from usage_detector import invalidate_usage_cache
 
 PORT = 5055
 HOST = "127.0.0.1"
@@ -105,11 +106,11 @@ def background_adaptive_watcher():
         lock.release()
 
 
-def get_dashboard_state():
+def get_dashboard_state(force=False):
     triggers = load_history().get("triggers", [])
     state = load_state()
     accounts = load_accounts()
-    usage = get_all_usage(accounts, state)
+    usage = get_all_usage(accounts, state, force=force)
 
     return {
         "server_time": datetime.now().strftime("%I:%M:%S %p"),
@@ -280,10 +281,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     f"{labels.get(key, key)}: {'SUCCESS in ' + str(res.get('duration')) + 's' if res.get('success') else 'FAILED - ' + str(res.get('error'))[:160]}",
                     "success" if res.get("success") else "error",
                 )
+            invalidate_usage_cache()
             self.send_json({
                 "success": any(r.get("success") for r in results.values()),
                 "results": [dict(res, key=key, label=labels.get(key, key)) for key, res in results.items()],
-                "state": get_dashboard_state(),
+                "state": get_dashboard_state(force=True),
             })
             return
 
@@ -349,8 +351,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except ValueError as e:
                 self.send_json({"error": str(e)}, status=400)
                 return
+            invalidate_usage_cache()
             push_event(f"Removed {acc.label}. Its folder and login stay in {acc.home}.", "info")
-            self.send_json({"removed": acc.key, "state": get_dashboard_state()})
+            self.send_json({"removed": acc.key, "state": get_dashboard_state(force=True)})
             return
 
         if path == "/api/toggle-startup":
@@ -411,8 +414,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <style>
     :root {
       --bg-primary: #0a0e17;
-      --bg-card: rgba(18, 24, 38, 0.85);
-      --bg-card-sub: rgba(10, 14, 23, 0.6);
+      --bg-card: #111726;
+      --bg-card-sub: #0a0e17;
       --border-color: rgba(255, 255, 255, 0.08);
       --border-highlight: rgba(99, 102, 241, 0.35);
       --accent-claude: #a855f7;
@@ -428,6 +431,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --radius-lg: 18px;
       --radius-md: 12px;
       --radius-sm: 8px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, ::before, ::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -457,7 +468,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       align-items: center;
       padding: 16px 24px;
       background: var(--bg-card);
-      backdrop-filter: blur(16px);
       border: 1px solid var(--border-color);
       border-radius: var(--radius-lg);
     }
@@ -532,7 +542,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     .card {
       background: var(--bg-card);
-      backdrop-filter: blur(16px);
       border: 1px solid var(--border-color);
       border-radius: var(--radius-lg);
       padding: 22px;
@@ -541,7 +550,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       gap: 16px;
       position: relative;
       overflow: hidden;
-      transition: all 0.25s ease;
+      transition: border-color 0.2s ease;
     }
 
     .card.claude-card { border-top: 3px solid var(--accent-claude); }
@@ -598,13 +607,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       height: 6px;
       border-radius: 50%;
       background: currentColor;
-      box-shadow: 0 0 8px currentColor;
+      display: inline-block;
+    }
+
+    .status-badge.active .pulse-dot {
+      box-shadow: 0 0 6px currentColor;
       animation: pulse 2s infinite;
     }
 
     @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.8); }
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
     }
 
     /* Countdown Display */
@@ -621,8 +634,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       margin: 4px 0;
     }
 
-    .claude-card .digits { text-shadow: 0 0 25px var(--accent-claude-glow); }
-    .codex-card .digits { text-shadow: 0 0 25px var(--accent-codex-glow); }
+    .claude-card .digits { text-shadow: 0 0 12px var(--accent-claude-glow); }
+    .codex-card .digits { text-shadow: 0 0 12px var(--accent-codex-glow); }
 
     .timer-center .sub {
       font-size: 12px;
@@ -1038,7 +1051,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     function setBusy(state) {
       busy = state;
       document.getElementById('btnWarmAll').disabled = state;
-      document.querySelectorAll('.warm-btn').forEach(el => { el.disabled = state; });
+      for (const node of cards.values()) {
+        if (node.warmBtn) node.warmBtn.disabled = state;
+      }
     }
 
     function fmt(sec) {
@@ -1076,7 +1091,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         card.querySelector('.relogin-btn').addEventListener('click', () => relogin(acc.key, acc.label));
         card.querySelector('.remove-btn').addEventListener('click', () => removeAccount(acc.key, acc.label, acc.dir));
         wrap.appendChild(card);
-        cards.set(acc.key, card);
+        cards.set(acc.key, {
+          card,
+          badge: card.querySelector('.status-badge'),
+          badgeText: card.querySelector('.badge-text'),
+          digits: card.querySelector('.digits'),
+          progressFill: card.querySelector('.progress-fill'),
+          mStart: card.querySelector('.m-start'),
+          mReset: card.querySelector('.m-reset'),
+          mTokens: card.querySelector('.m-tokens'),
+          mCount: card.querySelector('.m-count'),
+          accSub: card.querySelector('.acc-sub'),
+          sub: card.querySelector('.sub'),
+          warmBtn: btn,
+        });
       }
       for (const key of Object.keys(remaining)) {
         if (!cards.has(key)) delete remaining[key];
@@ -1085,26 +1113,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function renderCard(acc) {
-      const card = cards.get(acc.key);
-      if (!card) return;
+      const node = cards.get(acc.key);
+      if (!node) return;
       const d = acc.usage || {};
-      const q = sel => card.querySelector(sel);
-      q('.status-badge').className = `status-badge ${String(d.status || 'idle').toLowerCase()}`;
-      q('.badge-text').textContent = d.status || 'IDLE';
-      q('.digits').textContent = d.time_remaining || '--:--:--';
-      q('.progress-fill').style.width = (d.progress_pct || 0) + '%';
-      q('.m-start').textContent = d.window_start || 'N/A';
-      q('.m-reset').textContent = d.window_reset || 'N/A';
-      q('.m-tokens').textContent = (d.tokens?.total || 0).toLocaleString();
-      q('.m-count').textContent = acc.tool === 'claude'
+      const statusClass = String(d.status || 'idle').toLowerCase();
+      node.badge.className = `status-badge ${statusClass}`;
+      node.badgeText.textContent = d.status || 'IDLE';
+      node.digits.textContent = d.time_remaining || '--:--:--';
+      node.progressFill.style.width = (d.progress_pct || 0) + '%';
+      node.mStart.textContent = d.window_start || 'N/A';
+      node.mReset.textContent = d.window_reset || 'N/A';
+      node.mTokens.textContent = (d.tokens?.total || 0).toLocaleString();
+      node.mCount.textContent = acc.tool === 'claude'
         ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
         : `${d.turns_in_5h || 0} turns`;
       const extra = acc.tool === 'claude'
         ? (d.models_used?.length ? ' · ' + d.models_used.join(', ') : '')
         : (d.plan_type ? ' · ' + d.plan_type : '');
-      q('.acc-sub').textContent = acc.dir + extra;
-      q('.sub').textContent = subText(d, acc.cooldown || 0, acc.failures || 0);
-      remaining[acc.key] = d.is_active ? (d.remaining_seconds || 0) : 0;
+      node.accSub.textContent = acc.dir + extra;
+      node.sub.textContent = subText(d, acc.cooldown || 0, acc.failures || 0);
+
+      if (d.is_active && (d.reset_epoch || d.remaining_seconds)) {
+        const resetEpoch = d.reset_epoch ? Number(d.reset_epoch) : (Date.now() / 1000 + Number(d.remaining_seconds || 0));
+        remaining[acc.key] = { resetEpoch, is_active: true };
+      } else {
+        remaining[acc.key] = null;
+      }
     }
 
     function subText(d, cooldown, failures) {
@@ -1384,18 +1418,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       log('Sign-in link copied - paste it into a private/incognito window.', 'info');
     }
 
-    // Local 1s countdown between server polls.
-    setInterval(() => {
-      for (const [key, sec] of Object.entries(remaining)) {
-        if (sec <= 0) continue;
-        remaining[key] = sec - 1;
-        const card = cards.get(key);
-        if (card) card.querySelector('.digits').textContent = fmt(sec - 1);
+    // Local 1s countdown between server polls (idle-aware & drift-free).
+    function tickCountdown() {
+      if (document.hidden) return;
+      const now = Date.now() / 1000;
+      for (const [key, item] of Object.entries(remaining)) {
+        if (!item || !item.is_active) continue;
+        const left = Math.max(0, Math.round(item.resetEpoch - now));
+        const node = cards.get(key);
+        if (node && node.digits) {
+          node.digits.textContent = left > 0 ? fmt(left) : '00h 00m 00s';
+        }
       }
-    }, 1000);
+    }
+
+    let pollInterval = null;
+    let countdownInterval = null;
+
+    function startLoops() {
+      if (!countdownInterval) countdownInterval = setInterval(tickCountdown, 1000);
+      if (!pollInterval) pollInterval = setInterval(fetchStatus, 15000);
+    }
+
+    function stopLoops() {
+      if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    }
+
+    // Stop CPU/GPU work when tab is minimized or hidden in background.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopLoops();
+      } else {
+        fetchStatus();
+        startLoops();
+      }
+    });
 
     fetchStatus();
-    setInterval(fetchStatus, 8000);
+    startLoops();
   </script>
 </body>
 </html>

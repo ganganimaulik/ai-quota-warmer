@@ -54,6 +54,22 @@ _FILE_CACHE = {}
 _FILE_CACHE_LOCK = threading.Lock()
 _FILE_CACHE_MAX = 4000
 
+# (tool, home, exact, allow_live_cli) -> (timestamp, result_dict)
+_USAGE_CACHE = {}
+_USAGE_CACHE_LOCK = threading.Lock()
+USAGE_CACHE_TTL_SEC = 10.0
+
+
+def invalidate_usage_cache(tool=None, home=None):
+    """Invalidates the in-memory usage cache for a tool/account or all accounts."""
+    with _USAGE_CACHE_LOCK:
+        if tool is None and home is None:
+            _USAGE_CACHE.clear()
+        else:
+            to_del = [k for k in _USAGE_CACHE if (tool is None or k[0] == tool) and (home is None or k[1] == str(home))]
+            for k in to_del:
+                _USAGE_CACHE.pop(k, None)
+
 
 def claude_home(config_dir=None) -> Path:
     """The Claude Code config directory: explicit, else $CLAUDE_CONFIG_DIR, else ~/.claude."""
@@ -86,12 +102,50 @@ def _parse_ts(ts_str):
         return None
 
 
-def _iter_recent_files(pattern, cutoff_ts):
-    """Yields files matching a glob whose mtime is at or after the cutoff."""
-    for path in glob.glob(pattern, recursive=True):
+def _iter_recent_files(root_dir_or_pattern, cutoff_ts):
+    """
+    Yields files matching whose mtime is at or after the cutoff.
+    Uses fast recursive os.scandir traversal to avoid separate stat system calls on Windows.
+    """
+    if isinstance(root_dir_or_pattern, Path):
+        root_dir = str(root_dir_or_pattern)
+        suffix = ".jsonl"
+    elif isinstance(root_dir_or_pattern, str):
+        if "**" in root_dir_or_pattern:
+            root_dir = root_dir_or_pattern.split("**")[0].rstrip("/\\")
+            suffix = ".jsonl"
+        elif os.path.isdir(root_dir_or_pattern):
+            root_dir = root_dir_or_pattern
+            suffix = ".jsonl"
+        else:
+            for path in glob.glob(root_dir_or_pattern, recursive=True):
+                try:
+                    if os.path.getmtime(path) >= cutoff_ts:
+                        yield path
+                except OSError:
+                    continue
+            return
+    else:
+        root_dir = str(root_dir_or_pattern)
+        suffix = ".jsonl"
+
+    if not os.path.isdir(root_dir):
+        return
+
+    stack = [root_dir]
+    while stack:
+        curr = stack.pop()
         try:
-            if os.path.getmtime(path) >= cutoff_ts:
-                yield path
+            with os.scandir(curr) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False) and (not suffix or entry.name.endswith(suffix)):
+                            if entry.stat().st_mtime >= cutoff_ts:
+                                yield entry.path
+                    except OSError:
+                        continue
         except OSError:
             continue
 
@@ -709,27 +763,43 @@ def get_codex_actual_usage(home=None):
     }
 
 
-def get_account_usage(tool, home=None, exact=None, allow_live_cli=True):
+def get_account_usage(tool, home=None, exact=None, allow_live_cli=True, force=False):
     """
     The 5-hour window of one account directory. Never raises: a failed read
     comes back as an ERROR reading, which callers treat as "do not warm".
     """
+    exact_key = tuple(sorted(exact.items())) if isinstance(exact, dict) else str(exact)
+    cache_key = (tool, str(home) if home is not None else None, exact_key, bool(allow_live_cli))
+
+    now = time.time()
+    if not force:
+        with _USAGE_CACHE_LOCK:
+            cached = _USAGE_CACHE.get(cache_key)
+            if cached and (now - cached[0] < USAGE_CACHE_TTL_SEC):
+                return dict(cached[1])
+
     try:
         if tool == "claude":
-            return get_claude_actual_usage(home, exact=exact, allow_live_cli=allow_live_cli)
-        return get_codex_actual_usage(home)
+            res = get_claude_actual_usage(home, exact=exact, allow_live_cli=allow_live_cli)
+        else:
+            res = get_codex_actual_usage(home)
     except Exception as e:  # never let a telemetry read crash a caller's UI loop
-        return _error_state(tool, e)
+        res = _error_state(tool, e)
+
+    with _USAGE_CACHE_LOCK:
+        _USAGE_CACHE[cache_key] = (now, dict(res))
+
+    return res
 
 
 def get_actual_usage_summary():
     """Returns the combined actual 5-hour limit usage for the default Codex and Claude Code accounts."""
     try:
-        claude = get_claude_actual_usage()
+        claude = get_account_usage("claude")
     except Exception as e:  # never let a telemetry read crash a caller's UI loop
         claude = _error_state("claude", e)
     try:
-        codex = get_codex_actual_usage()
+        codex = get_account_usage("codex")
     except Exception as e:
         codex = _error_state("codex", e)
 
