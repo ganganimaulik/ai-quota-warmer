@@ -444,9 +444,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      background: radial-gradient(circle at top center, #151a30 0%, #0a0e17 65%, #05080e 100%);
+      background: #0a0e17;
       color: var(--text-main);
-      font-family: 'Outfit', sans-serif;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       min-height: 100vh;
       padding: 24px;
       display: flex;
@@ -487,7 +487,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       font-size: 22px;
-      box-shadow: 0 4px 20px rgba(168, 85, 247, 0.4);
     }
 
     .brand-title h1 {
@@ -506,7 +505,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
       padding: 8px 14px;
       border-radius: 20px;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'JetBrains Mono', Consolas, monospace;
       font-size: 13px;
       color: #38bdf8;
       display: flex;
@@ -536,7 +535,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     .empty-state code {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'JetBrains Mono', Consolas, monospace;
       color: var(--text-main);
     }
 
@@ -550,7 +549,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       gap: 16px;
       position: relative;
       overflow: hidden;
-      transition: border-color 0.2s ease;
+      contain: layout style;
     }
 
     .card.claude-card { border-top: 3px solid var(--accent-claude); }
@@ -603,21 +602,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .status-badge.error { background: rgba(244, 63, 94, 0.15); color: var(--accent-rose); border: 1px solid rgba(244, 63, 94, 0.35); }
 
     .pulse-dot {
-      width: 6px;
-      height: 6px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: currentColor;
       display: inline-block;
-    }
-
-    .status-badge.active .pulse-dot {
-      box-shadow: 0 0 6px currentColor;
-      animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.35; }
+      flex-shrink: 0;
     }
 
     /* Countdown Display */
@@ -627,15 +617,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     .timer-center .digits {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'JetBrains Mono', Consolas, monospace;
       font-size: 38px;
       font-weight: 700;
       color: #fff;
       margin: 4px 0;
+      letter-spacing: -0.5px;
     }
-
-    .claude-card .digits { text-shadow: 0 0 12px var(--accent-claude-glow); }
-    .codex-card .digits { text-shadow: 0 0 12px var(--accent-codex-glow); }
 
     .timer-center .sub {
       font-size: 12px;
@@ -706,28 +694,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     .btn-claude {
-      background: linear-gradient(135deg, #a855f7, #7c3aed);
+      background: #7c3aed;
       color: #fff;
-      box-shadow: 0 4px 16px var(--accent-claude-glow);
     }
 
-    .btn-claude:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-claude-glow); }
+    .btn-claude:hover { background: #6d28d9; }
 
     .btn-codex {
-      background: linear-gradient(135deg, #06b6d4, #0284c7);
+      background: #0284c7;
       color: #fff;
-      box-shadow: 0 4px 16px var(--accent-codex-glow);
     }
 
-    .btn-codex:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-codex-glow); }
+    .btn-codex:hover { background: #0369a1; }
 
     .btn-primary {
-      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      background: #4f46e5;
       color: #fff;
-      box-shadow: 0 4px 18px rgba(99, 102, 241, 0.4);
     }
 
-    .btn-primary:hover { transform: translateY(-1px); }
+    .btn-primary:hover { background: #4338ca; }
 
     .btn-secondary {
       background: rgba(255, 255, 255, 0.05);
@@ -809,17 +794,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .console-line.info { color: #38bdf8; }
     .console-line.warn { color: var(--accent-amber); }
 
-    .spinner {
-      border: 2px solid rgba(255, 255, 255, 0.2);
-      border-left-color: #fff;
-      border-radius: 50%;
-      width: 14px;
-      height: 14px;
-      animation: spin 0.8s linear infinite;
-      display: inline-block;
-    }
 
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
     /* `hidden` must win over the display rules below. */
     [hidden] { display: none !important; }
@@ -1117,21 +1092,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (!node) return;
       const d = acc.usage || {};
       const statusClass = String(d.status || 'idle').toLowerCase();
-      node.badge.className = `status-badge ${statusClass}`;
-      node.badgeText.textContent = d.status || 'IDLE';
-      node.digits.textContent = d.time_remaining || '--:--:--';
-      node.progressFill.style.width = (d.progress_pct || 0) + '%';
-      node.mStart.textContent = d.window_start || 'N/A';
-      node.mReset.textContent = d.window_reset || 'N/A';
-      node.mTokens.textContent = (d.tokens?.total || 0).toLocaleString();
-      node.mCount.textContent = acc.tool === 'claude'
+      const badgeCls = `status-badge ${statusClass}`;
+      if (node.badge.className !== badgeCls) node.badge.className = badgeCls;
+      if (node.badgeText.textContent !== (d.status || 'IDLE')) node.badgeText.textContent = d.status || 'IDLE';
+
+      const initialDigits = d.time_remaining || '--:--:--';
+      if (!d.is_active && node.digits.textContent !== initialDigits) node.digits.textContent = initialDigits;
+
+      const progressPct = (d.progress_pct || 0) + '%';
+      if (node.progressFill.style.width !== progressPct) node.progressFill.style.width = progressPct;
+
+      const start = d.window_start || 'N/A';
+      if (node.mStart.textContent !== start) node.mStart.textContent = start;
+
+      const reset = d.window_reset || 'N/A';
+      if (node.mReset.textContent !== reset) node.mReset.textContent = reset;
+
+      const tokens = (d.tokens?.total || 0).toLocaleString();
+      if (node.mTokens.textContent !== tokens) node.mTokens.textContent = tokens;
+
+      const count = acc.tool === 'claude'
         ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
         : `${d.turns_in_5h || 0} turns`;
+      if (node.mCount.textContent !== count) node.mCount.textContent = count;
+
       const extra = acc.tool === 'claude'
         ? (d.models_used?.length ? ' · ' + d.models_used.join(', ') : '')
         : (d.plan_type ? ' · ' + d.plan_type : '');
-      node.accSub.textContent = acc.dir + extra;
-      node.sub.textContent = subText(d, acc.cooldown || 0, acc.failures || 0);
+      const subDir = acc.dir + extra;
+      if (node.accSub.textContent !== subDir) node.accSub.textContent = subDir;
+
+      const text = subText(d, acc.cooldown || 0, acc.failures || 0);
+      if (node.sub.textContent !== text) node.sub.textContent = text;
 
       if (d.is_active && (d.reset_epoch || d.remaining_seconds)) {
         const resetEpoch = d.reset_epoch ? Number(d.reset_epoch) : (Date.now() / 1000 + Number(d.remaining_seconds || 0));
@@ -1427,7 +1419,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const left = Math.max(0, Math.round(item.resetEpoch - now));
         const node = cards.get(key);
         if (node && node.digits) {
-          node.digits.textContent = left > 0 ? fmt(left) : '00h 00m 00s';
+          const nextText = left > 0 ? fmt(left) : '00h 00m 00s';
+          if (node.digits.textContent !== nextText) {
+            node.digits.textContent = nextText;
+          }
         }
       }
     }
