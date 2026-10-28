@@ -4,7 +4,7 @@ AI Quota Warmer - Web Dashboard UI with Live Actual Usage Detector
 -------------------------------------------------------------------
 A modern local web dashboard displaying ACTUAL 5-hour limit usage, token counts,
 real reset countdowns, and unattended automation controls for every configured
-Codex and Claude Code account.
+Codex, Claude Code and Gemini account.
 """
 
 import json
@@ -18,6 +18,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 from quota_warmer import (
+    DEFAULT_ACCOUNT,
     load_history,
     load_state,
     load_accounts,
@@ -30,6 +31,9 @@ from quota_warmer import (
     dismiss_login_job,
     cooldown_remaining,
     get_all_usage,
+    refresh_live_status,
+    report_signed_out,
+    record_login,
     run_trigger_batch,
     warm_cycle,
     sleep_until_next_cycle,
@@ -94,9 +98,13 @@ def background_adaptive_watcher():
         while True:
             sleep_for = 60.0
             try:
+                # Re-read every pass so accounts added from the CLI appear without a restart.
+                accounts = load_accounts()
                 if ADAPTIVE_AUTO_WARM_ENABLED:
-                    # Re-read every pass so accounts added from the CLI appear without a restart.
-                    sleep_for = warm_cycle(load_accounts(), prompt="hi", notify=True, log=_watcher_log)
+                    sleep_for = warm_cycle(accounts, prompt="hi", notify=True, log=_watcher_log)
+                else:
+                    # Keep the Claude countdowns and sign-in states current even while auto-warm is off.
+                    report_signed_out(refresh_live_status(accounts), log=_watcher_log)
             except Exception as e:
                 push_event(f"Watcher error: {type(e).__name__}: {e}", "error")
 
@@ -120,6 +128,7 @@ def get_dashboard_state(force=False):
                 usage=usage[acc.key],
                 cooldown=int(cooldown_remaining(acc.key, state)),
                 failures=int((state.get(acc.key) or {}).get("consecutive_failures", 0)),
+                login=(state.get(acc.key) or {}).get("login"),
             )
             for acc in accounts
         ],
@@ -145,6 +154,10 @@ def check_all_logins():
         t.start()
     for t in threads:
         t.join()
+    for acc in accounts:
+        status = statuses.get(acc.key) or {}
+        if status.get("logged_in") is not None:
+            record_login(acc.key, status["logged_in"], status.get("detail"), via="check")
     return [
         dict(statuses.get(acc.key) or {}, key=acc.key, label=acc.label,
              summary=describe_login(statuses.get(acc.key) or {}))
@@ -261,7 +274,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 target, accounts, what = acc.key, [acc], acc.label
             else:
                 target = payload.get("target", "all")
-                if target not in ("all", "claude", "codex"):
+                if target not in ("all", "claude", "codex", "gemini"):
                     self.send_json({"error": "Invalid target."}, status=400)
                     return
                 accounts, what = select_accounts(target), target.upper()
@@ -274,6 +287,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 accounts=accounts,
                 claude_model=payload.get("claude_model"),
                 codex_model=payload.get("codex_model"),
+                gemini_model=payload.get("gemini_model"),
             )
             labels = {a.key: a.label for a in accounts}
             for key, res in results.items():
@@ -298,9 +312,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/accounts/add":
             try:
-                # The folder is always the default ~/.claude-NAME / ~/.codex-NAME;
-                # custom folders stay a CLI option (--dir).
-                acc = prepare_account(str(payload.get("tool") or ""), str(payload.get("name") or "").strip())
+                # The folder is always the default ~/.claude-NAME, ~/.codex-NAME
+                # or ~/.gemini-NAME; custom folders stay a CLI option (--dir). A
+                # Gemini account without a name is agy's own sign-in (default).
+                tool = str(payload.get("tool") or "")
+                name = str(payload.get("name") or "").strip() or (DEFAULT_ACCOUNT if tool == "gemini" else "")
+                acc = prepare_account(tool, name)
                 job = start_login_job(acc, register=True)
             except (ValueError, OSError) as e:
                 self.send_json({"error": str(e)}, status=400)
@@ -422,6 +439,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --accent-claude-glow: rgba(168, 85, 247, 0.35);
       --accent-codex: #06b6d4;
       --accent-codex-glow: rgba(6, 182, 212, 0.35);
+      --accent-gemini: #4c8dff;
       --accent-green: #10b981;
       --accent-amber: #f59e0b;
       --accent-rose: #f43f5e;
@@ -554,6 +572,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     .card.claude-card { border-top: 3px solid var(--accent-claude); }
     .card.codex-card { border-top: 3px solid var(--accent-codex); }
+    .card.gemini-card { border-top: 3px solid var(--accent-gemini); }
 
     .card-header {
       display: flex;
@@ -579,6 +598,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     .claude-card .tool-avatar { background: rgba(168, 85, 247, 0.2); border: 1px solid rgba(168, 85, 247, 0.4); }
     .codex-card .tool-avatar { background: rgba(6, 182, 212, 0.2); border: 1px solid rgba(6, 182, 212, 0.4); }
+    .gemini-card .tool-avatar { background: rgba(76, 141, 255, 0.2); border: 1px solid rgba(76, 141, 255, 0.4); }
 
     .tool-title h2 { font-size: 16px; font-weight: 700; }
     .tool-title span { font-size: 12px; color: var(--text-muted); }
@@ -599,7 +619,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .status-badge.expired,
     .status-badge.reset { background: rgba(245, 158, 11, 0.15); color: var(--accent-amber); border: 1px solid rgba(245, 158, 11, 0.3); }
     .status-badge.idle { background: rgba(156, 163, 175, 0.15); color: var(--text-muted); border: 1px solid var(--border-color); }
-    .status-badge.error { background: rgba(244, 63, 94, 0.15); color: var(--accent-rose); border: 1px solid rgba(244, 63, 94, 0.35); }
+    .status-badge.limited { background: rgba(251, 146, 60, 0.15); color: #fb923c; border: 1px solid rgba(251, 146, 60, 0.35); }
+    .status-badge.error,
+    .status-badge.signedout { background: rgba(244, 63, 94, 0.15); color: var(--accent-rose); border: 1px solid rgba(244, 63, 94, 0.35); }
+
+    .signin-alert {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      background: rgba(244, 63, 94, 0.1);
+      border: 1px solid rgba(244, 63, 94, 0.35);
+    }
+
+    .signin-alert strong { display: block; color: var(--accent-rose); font-size: 13px; }
+    .signin-reason { display: block; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+    .btn-signin { background: #e11d48; color: #fff; }
+    .btn-signin:hover { background: #be123c; }
 
     .pulse-dot {
       width: 8px;
@@ -647,6 +686,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     .claude-card .progress-fill { background: linear-gradient(90deg, #a855f7, #c084fc); }
     .codex-card .progress-fill { background: linear-gradient(90deg, #06b6d4, #38bdf8); }
+    .gemini-card .progress-fill { background: linear-gradient(90deg, #4c8dff, #a3c4ff); }
 
     /* Key-Value Metrics Grid */
     .metrics-grid {
@@ -706,6 +746,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     .btn-codex:hover { background: #0369a1; }
+
+    .btn-gemini {
+      background: #1a73e8;
+      color: #fff;
+    }
+
+    .btn-gemini:hover { background: #1765cc; }
 
     .btn-primary {
       background: #4f46e5;
@@ -858,7 +905,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="brand-icon">⚡</div>
         <div class="brand-title">
           <h1>AI Quota Warmer & Live Usage Tracker</h1>
-          <p>Real-Time 5-Hour Rolling Limit Detector for OpenAI Codex & Claude Code</p>
+          <p>Real-Time 5-Hour Rolling Limit Detector for OpenAI Codex, Claude Code & Google Gemini</p>
         </div>
       </div>
       <div style="display: flex; gap: 10px; align-items: center;">
@@ -878,12 +925,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="panel" id="accountPanel" hidden>
       <div id="addForm">
         <h3>Add an account</h3>
-        <p class="muted">Signs in through the tool's own browser login and keeps it in a folder of
+        <p class="muted" id="addFolderNote">Signs in through the tool's own browser login and keeps it in a folder of
           its own (~/.claude-NAME or ~/.codex-NAME). The account shows up here once the sign-in finishes.</p>
+        <p class="muted" id="addGeminiNote" hidden>Each named Gemini account gets a folder of its own
+          (~/.gemini-NAME) that the Antigravity CLI (agy) runs in, with its own Google sign-in, apart from
+          agy's main login. A window with agy opens: pick Google OAuth, open the link it shows in a
+          private/incognito window, sign in with the Google account you want and paste the code back into
+          that window. The account shows up here as soon as it is signed in.</p>
+        <p class="muted" id="addGeminiDefaultNote" hidden>Leave the name empty to add agy's main login (the one
+          you use when you run agy yourself) instead.</p>
         <div class="form-row">
-          <select class="field" id="addTool">
+          <select class="field" id="addTool" onchange="syncAddForm()">
             <option value="claude">Claude Code</option>
             <option value="codex">Codex</option>
+            <option value="gemini">Gemini (Antigravity CLI)</option>
           </select>
           <input class="field" id="addName" maxlength="32" placeholder="Name, e.g. personal2"
                  autocomplete="off" onkeydown="if (event.key === 'Enter') submitAdd()">
@@ -896,7 +951,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="loginView" hidden>
         <h3 id="loginTitle">Signing in…</h3>
         <div id="loginRunning">
-          <p class="muted">A browser tab should have opened. Finish the sign-in there.</p>
+          <p class="muted" id="loginHint">A browser tab should have opened. Finish the sign-in there.</p>
           <div id="linkBox" hidden>
             <p class="muted">Is that browser signed in to a different account? Copy this link into a
               private/incognito window and sign in there with the account you want:</p>
@@ -971,6 +1026,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const CSRF_TOKEN = '__CSRF_TOKEN__';
     const cards = new Map();      // account key -> card element
     const remaining = {};         // account key -> seconds left, ticked locally between polls
+    const signedOutKeys = new Set();  // accounts already reported signed out in the console
     let cardKeys = null;
     let busy = false;
     let lastEventKey = '';
@@ -984,6 +1040,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="tool-title"><h2 class="acc-label"></h2><span class="acc-sub"></span></div>
         </div>
         <div class="status-badge idle"><span class="pulse-dot"></span> <span class="badge-text">IDLE</span></div>
+      </div>
+      <div class="signin-alert" hidden>
+        <div><strong>Signed out</strong><span class="signin-reason"></span></div>
+        <button class="btn btn-sm btn-signin">🔑 Sign in again</button>
       </div>
       <div class="timer-center">
         <div class="digits">--:--:--</div>
@@ -1045,25 +1105,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
+    // Per tool: card icon and the labels of the two bottom metrics. agy keeps
+    // no local activity log, so Gemini shows its quota shares instead.
+    const TOOL_UI = {
+      claude: { icon: '🟣', count: 'USER PROMPTS IN 5H', tokens: 'TOTAL TOKENS USED' },
+      codex: { icon: '🤖', count: 'TURNS IN 5H', tokens: 'TOKENS IN SESSION' },
+      gemini: { icon: '✨', count: '5H QUOTA USED', tokens: 'WEEKLY QUOTA USED' },
+    };
+
     function buildCards(accounts) {
       const wrap = document.getElementById('accountCards');
       wrap.textContent = '';
       cards.clear();
       for (const acc of accounts) {
-        const isClaude = acc.tool === 'claude';
+        const ui = TOOL_UI[acc.tool] || TOOL_UI.codex;
         const card = document.createElement('div');
-        card.className = `card ${isClaude ? 'claude-card' : 'codex-card'}`;
+        card.className = `card ${acc.tool}-card`;
         card.innerHTML = CARD_HTML;
-        card.querySelector('.tool-avatar').textContent = isClaude ? '🟣' : '🤖';
+        card.querySelector('.tool-avatar').textContent = ui.icon;
         card.querySelector('.acc-label').textContent = acc.label;
-        card.querySelector('.m-count-label').textContent = isClaude ? 'USER PROMPTS IN 5H' : 'TURNS IN 5H';
-        card.querySelector('.m-tokens-label').textContent = isClaude ? 'TOTAL TOKENS USED' : 'TOKENS IN SESSION';
+        card.querySelector('.m-count-label').textContent = ui.count;
+        card.querySelector('.m-tokens-label').textContent = ui.tokens;
         const btn = card.querySelector('.warm-btn');
-        btn.classList.add(isClaude ? 'btn-claude' : 'btn-codex');
-        btn.textContent = `${isClaude ? '🟣' : '🤖'} Warm Up ${acc.label}`;
+        btn.classList.add(`btn-${acc.tool}`);
+        btn.textContent = `${ui.icon} Warm Up ${acc.label}`;
         btn.disabled = busy;
         btn.addEventListener('click', () => trigger({ account: acc.key }, acc.label));
         card.querySelector('.relogin-btn').addEventListener('click', () => relogin(acc.key, acc.label));
+        card.querySelector('.btn-signin').addEventListener('click', () => relogin(acc.key, acc.label));
         card.querySelector('.remove-btn').addEventListener('click', () => removeAccount(acc.key, acc.label, acc.dir));
         wrap.appendChild(card);
         cards.set(acc.key, {
@@ -1078,6 +1147,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           mCount: card.querySelector('.m-count'),
           accSub: card.querySelector('.acc-sub'),
           sub: card.querySelector('.sub'),
+          signinAlert: card.querySelector('.signin-alert'),
+          signinReason: card.querySelector('.signin-reason'),
+          signinBtn: card.querySelector('.btn-signin'),
           warmBtn: btn,
         });
       }
@@ -1085,16 +1157,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         if (!cards.has(key)) delete remaining[key];
       }
       document.getElementById('noAccounts').style.display = accounts.length ? 'none' : 'block';
+      syncAddForm();  // Gemini may have just been added or removed while the add form is open
     }
 
     function renderCard(acc) {
       const node = cards.get(acc.key);
       if (!node) return;
       const d = acc.usage || {};
-      const statusClass = String(d.status || 'idle').toLowerCase();
-      const badgeCls = `status-badge ${statusClass}`;
+      const signedOut = acc.login?.logged_in === false;
+      const statusText = signedOut ? 'SIGNED OUT' : (d.status || 'IDLE');
+      const badgeCls = `status-badge ${signedOut ? 'signedout' : statusText.toLowerCase()}`;
       if (node.badge.className !== badgeCls) node.badge.className = badgeCls;
-      if (node.badgeText.textContent !== (d.status || 'IDLE')) node.badgeText.textContent = d.status || 'IDLE';
+      if (node.badgeText.textContent !== statusText) node.badgeText.textContent = statusText;
+
+      const reason = signedOut ? (acc.login.detail || 'Not signed in.') : '';
+      if (node.signinAlert.hidden === signedOut) node.signinAlert.hidden = !signedOut;
+      if (node.signinReason.textContent !== reason) node.signinReason.textContent = reason;
+      const signingIn = !!(currentJob && currentJob.active && currentJob.key === acc.key);
+      const signinText = signingIn ? '↻ Restart sign-in' : '🔑 Sign in again';
+      if (node.signinBtn.textContent !== signinText) node.signinBtn.textContent = signinText;
+      if (signedOut && !signedOutKeys.has(acc.key)) {
+        log(`${acc.label} is signed out: ${reason} Use "Sign in again" on its card.`, 'error');
+      }
+      if (signedOut) signedOutKeys.add(acc.key); else signedOutKeys.delete(acc.key);
 
       const initialDigits = d.time_remaining || '--:--:--';
       if (!d.is_active && node.digits.textContent !== initialDigits) node.digits.textContent = initialDigits;
@@ -1108,13 +1193,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const reset = d.window_reset || 'N/A';
       if (node.mReset.textContent !== reset) node.mReset.textContent = reset;
 
-      const tokens = (d.tokens?.total || 0).toLocaleString();
-      if (node.mTokens.textContent !== tokens) node.mTokens.textContent = tokens;
-
-      const count = acc.tool === 'claude'
-        ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
-        : `${d.turns_in_5h || 0} turns`;
+      let count, tokens;
+      if (acc.tool === 'gemini') {
+        count = pctText(d.session_used_pct);
+        tokens = pctText(d.week_used_pct) + (d.week_reset && d.week_reset !== 'N/A' ? ` · resets ${d.week_reset}` : '');
+      } else {
+        count = acc.tool === 'claude'
+          ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
+          : `${d.turns_in_5h || 0} turns`;
+        tokens = (d.tokens?.total || 0).toLocaleString();
+      }
       if (node.mCount.textContent !== count) node.mCount.textContent = count;
+      if (node.mTokens.textContent !== tokens) node.mTokens.textContent = tokens;
 
       const extra = acc.tool === 'claude'
         ? (d.models_used?.length ? ' · ' + d.models_used.join(', ') : '')
@@ -1122,7 +1212,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const subDir = acc.dir + extra;
       if (node.accSub.textContent !== subDir) node.accSub.textContent = subDir;
 
-      const text = subText(d, acc.cooldown || 0, acc.failures || 0);
+      const text = signedOut
+        ? 'Auto-warm cannot start this account\'s windows until it is signed in again.'
+        : subText(d, acc.cooldown || 0, acc.failures || 0);
       if (node.sub.textContent !== text) node.sub.textContent = text;
 
       if (d.is_active && (d.reset_epoch || d.remaining_seconds)) {
@@ -1133,10 +1225,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
+    function pctText(v) {
+      return (v === null || v === undefined) ? 'N/A' : `${v}%`;
+    }
+
     function subText(d, cooldown, failures) {
       let sub;
       if (d.status === 'ERROR') {
         sub = 'Detector error: ' + (d.error || 'unknown');
+      } else if (d.status === 'LIMITED') {
+        sub = `Weekly limit used up · resets ${d.week_reset}. Auto-warm waits for it, so no AI credits are spent.`;
       } else if (d.is_active) {
         const quota = (d.session_used_pct !== null && d.session_used_pct !== undefined)
           ? `Quota ${d.session_used_pct}% used · ` : '';
@@ -1267,7 +1365,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('addForm').hidden = false;
       document.getElementById('loginView').hidden = true;
       document.getElementById('addError').textContent = '';
-      document.getElementById('addName').focus();
+      syncAddForm();
+      if (!document.getElementById('addName').hidden) document.getElementById('addName').focus();
+    }
+
+    // A Gemini account without a name is agy's own sign-in, until that one is added.
+    function geminiDefaultOpen() {
+      return document.getElementById('addTool').value === 'gemini' && !cards.has('gemini');
+    }
+
+    function syncAddForm() {
+      const gemini = document.getElementById('addTool').value === 'gemini';
+      document.getElementById('addFolderNote').hidden = gemini;
+      document.getElementById('addGeminiNote').hidden = !gemini;
+      document.getElementById('addGeminiDefaultNote').hidden = !geminiDefaultOpen();
+      document.getElementById('addName').placeholder = geminiDefaultOpen()
+        ? 'Name, e.g. work (empty: agy\'s main login)' : 'Name, e.g. personal2';
     }
 
     function closePanel() {
@@ -1282,7 +1395,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const name = document.getElementById('addName').value.trim();
       const err = document.getElementById('addError');
       err.textContent = '';
-      if (!name) { err.textContent = 'Give the account a name, e.g. personal2.'; return; }
+      if (!name && !geminiDefaultOpen()) { err.textContent = 'Give the account a name, e.g. personal2.'; return; }
       try {
         const data = await post('/api/accounts/add', { tool, name });
         document.getElementById('addName').value = '';
@@ -1294,10 +1407,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     async function relogin(key, label) {
+      // Asking again while a sign-in runs restarts it (the server cancels the old one).
+      const restarting = !!(currentJob && currentJob.active);
       try {
         const data = await post('/api/accounts/login', { account: key });
-        log(`Signing in ${label} again...`, 'info');
+        log(restarting ? `Restarted the sign-in - now signing in ${label}...` : `Signing in ${label} again...`, 'info');
         showLoginJob(data.job);
+        fetchStatus();
       } catch (e) {
         log('Sign-in error: ' + e.message, 'error');
       }
@@ -1351,6 +1467,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('loginTitle').textContent = `${verb} ${job.label}`;
       // While "starting" the CLI has not opened the browser yet.
       document.getElementById('loginRunning').hidden = job.state !== 'running';
+      document.getElementById('loginHint').textContent =
+        job.hint || 'A browser tab should have opened. Finish the sign-in there.';
 
       // Only ever link to https - the URL is text a CLI printed.
       const url = (job.url && /^https:\/\//.test(job.url)) ? job.url : '';
@@ -1473,7 +1591,11 @@ def run_server():
     except OSError as e:
         print(f"[-] Could not bind {url}: {e}")
         print("    Another AI Quota Warmer dashboard is probably already running.")
-        print(f"    Open {url} in your browser, or close the other instance first.")
+        print(f"    Opening {url} in your browser...")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
         return
     httpd.daemon_threads = True
 

@@ -1,6 +1,6 @@
 """
-Actual 5-Hour Usage & Rate Limit Detector for Claude Code and OpenAI Codex
--------------------------------------------------------------------------
+Actual 5-Hour Usage & Rate Limit Detector for Claude Code, OpenAI Codex and Gemini
+---------------------------------------------------------------------------------
 Reads real usage telemetry directly from local session logs:
 
 - OpenAI Codex CLI : ~/.codex/sessions/**/*.jsonl  (authoritative `rate_limits`
@@ -9,7 +9,10 @@ Reads real usage telemetry directly from local session logs:
 - Claude Code      : ~/.claude/projects/**/*.jsonl (session transcripts; Claude
                      does not persist its rate-limit headers locally, so the
                      5-hour window is inferred by clustering activity - unless
-                     the caller passes the exact window a warm-up reported).
+                     the caller passes the exact window Claude Code reported,
+                     from a warm-up or quota_warmer's free per-minute read).
+- Gemini (agy)     : no local record at all; the window is the reading the
+                     caller passes from quota_warmer's free `agy -p /usage`.
 
 Every reader takes the account's directory (CLAUDE_CONFIG_DIR / CODEX_HOME),
 so each account is measured from its own logs.
@@ -54,7 +57,9 @@ _FILE_CACHE = {}
 _FILE_CACHE_LOCK = threading.Lock()
 _FILE_CACHE_MAX = 4000
 
-# (tool, home, exact, allow_live_cli) -> (timestamp, result_dict)
+# (tool, home, allow_live_cli) -> (timestamp, exact_key, result_dict). The exact
+# window is compared rather than keyed on: it changes every minute, and keying
+# on it would grow the cache forever in a long-running dashboard.
 _USAGE_CACHE = {}
 _USAGE_CACHE_LOCK = threading.Lock()
 USAGE_CACHE_TTL_SEC = 10.0
@@ -451,16 +456,33 @@ def _exact_reset(exact, now_utc):
     return reset
 
 
+def _exact_closed_since(exact, now_utc):
+    """
+    When Claude Code reported that no window was open ({"resets_at": None,
+    "as_of": epoch}), the time it said so, if usable.
+    """
+    if not isinstance(exact, dict) or exact.get("resets_at") is not None:
+        return None
+    try:
+        as_of = datetime.fromtimestamp(float(exact.get("as_of")), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if not (now_utc - timedelta(hours=LOOKBACK_HOURS) <= as_of <= now_utc + timedelta(minutes=1)):
+        return None
+    return as_of
+
+
 def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
     """
     Detects the Claude Code 5-hour rolling window of one config directory.
 
-    `exact` is the window Claude Code itself reported for the last warm-up
-    ({"resets_at": epoch}, taken from its rate_limit_event). While that reset
-    is ahead it is used as-is. Once it has passed it anchors the clustering:
-    the next window opens at the first message after it. Without it the window
-    is inferred from transcripts alone - it opens at the first message after
-    the previous window lapsed and runs for five hours.
+    `exact` is the latest window Claude Code itself reported: from a warm-up's
+    rate_limit_event, or from the per-minute usage read ({"resets_at": epoch or
+    None, "as_of": epoch, "source": ...}). While that reset is ahead it is used
+    as-is. Once it has passed, or when no window was open as of the read, it
+    anchors the clustering: the next window opens at the first message after
+    it. Without it the window is inferred from transcripts alone - it opens at
+    the first message after the previous window lapsed and runs for five hours.
     """
     now_utc = datetime.now(timezone.utc)
     now_local = datetime.now().astimezone()
@@ -478,10 +500,14 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
     all_events.sort(key=lambda r: r[0])
 
     exact_reset = _exact_reset(exact, now_utc)
+    closed_since = _exact_closed_since(exact, now_utc)
+    exact_source = (exact.get("source") if isinstance(exact, dict) else None) or "rate-limit-event"
+    # Activity up to the known reset belonged to the window that closed, and
+    # activity before a "no window open" reading opened nothing still running.
+    anchor = exact_reset if (exact_reset is not None and exact_reset <= now_utc) else closed_since
     cluster_events = all_events
-    if exact_reset is not None and exact_reset <= now_utc:
-        # Everything up to the known reset belonged to the window that closed.
-        cluster_events = [r for r in all_events if r[0] > exact_reset]
+    if anchor is not None:
+        cluster_events = [r for r in all_events if r[0] > anchor]
     windows = _cluster_windows([(r[0], r) for r in cluster_events], CLAUDE_WINDOW_HOURS)
 
     live_cli = fetch_live_claude_cli() if allow_live_cli else None
@@ -502,7 +528,7 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
         start_dt_local = reset_dt_local - timedelta(hours=CLAUDE_WINDOW_HOURS)
         remaining_sec = max(0, int((exact_reset - now_utc).total_seconds()))
         is_active = remaining_sec > 0
-        source = "rate-limit-event"
+        source = exact_source
     elif active_window:
         start_dt_local = active_window[0].astimezone()
         reset_dt_local = active_window[1].astimezone()
@@ -519,13 +545,16 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
         start_dt_local = reset_dt_local - timedelta(hours=CLAUDE_WINDOW_HOURS)
         remaining_sec = 0
         is_active = False
-        source = "rate-limit-event"
+        source = exact_source
     else:
         start_dt_local = reset_dt_local = None
         remaining_sec = 0
         is_active = False
+        if closed_since is not None:
+            # Claude Code reported no window open and nothing has happened since.
+            source = exact_source
 
-    if source != "session-logs":
+    if source != "session-logs" and start_dt_local is not None:
         start_utc, end_utc = start_dt_local.astimezone(timezone.utc), reset_dt_local.astimezone(timezone.utc)
         window_events = [(r[0], r) for r in all_events if start_utc <= r[0] <= end_utc]
     else:
@@ -555,11 +584,14 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
     else:
         progress_pct = 0 if is_active else 100
 
+    # Quota percentages come with the per-minute usage read, not with warm-ups.
+    reported = exact if (isinstance(exact, dict) and source == exact_source) else {}
+
     return {
         "tool": "claude",
-        "has_data": bool(all_events) or live_cli is not None or exact_reset is not None,
+        "has_data": bool(all_events) or live_cli is not None or exact_reset is not None or closed_since is not None,
         "is_active": is_active,
-        "status": "ACTIVE" if is_active else ("EXPIRED" if (last_window or exact_reset) else "IDLE"),
+        "status": "ACTIVE" if is_active else ("EXPIRED" if (last_window or exact_reset or closed_since) else "IDLE"),
         "source": source,
         "window_start": _fmt_local(start_dt_local),
         "window_reset": _fmt_local(reset_dt_local),
@@ -568,8 +600,8 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
         "time_remaining": _fmt_remaining(remaining_sec, is_active),
         "remaining_seconds": remaining_sec,
         "progress_pct": progress_pct,
-        "session_used_pct": live_cli.get("session_used_pct") if live_cli else None,
-        "week_used_pct": live_cli.get("week_used_pct") if live_cli else None,
+        "session_used_pct": live_cli.get("session_used_pct") if live_cli else reported.get("used_pct"),
+        "week_used_pct": live_cli.get("week_used_pct") if live_cli else reported.get("week_used_pct"),
         "week_reset_raw": live_cli.get("week_reset_raw", "") if live_cli else "",
         "user_prompts": user_prompts,
         "total_events": len(window_events),
@@ -763,31 +795,120 @@ def get_codex_actual_usage(home=None):
     }
 
 
+# --------------------------------------------------------------------------
+# Google Gemini (Antigravity CLI)
+# --------------------------------------------------------------------------
+
+GEMINI_WEEK_HOURS = 7 * 24
+
+
+def _epoch_dt(value):
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _fmt_local_day(dt):
+    # Weekly resets are at most seven days out, so the weekday is enough.
+    return dt.astimezone().strftime("%a %I:%M %p") if dt else "N/A"
+
+
+def get_gemini_actual_usage(exact=None):
+    """
+    Reports the Gemini 5-hour window from the latest reading the Antigravity
+    CLI gave: quota_warmer's free `agy -p /usage` read, or the one taken right
+    after a warm-up ({"resets_at": epoch or None, "as_of": epoch, "used_pct",
+    "week_used_pct", "week_remaining", "week_resets_at", "source"}).
+
+    agy keeps no local record of its quota, so without a reading there is
+    nothing to report. A used-up weekly limit holds the account (LIMITED)
+    until the weekly reset: a warm-up before then could only fail, or be
+    billed to AI credits.
+    """
+    now_utc = datetime.now(timezone.utc)
+    exact = exact if isinstance(exact, dict) else {}
+    reset = _exact_reset(exact, now_utc)
+    closed_since = _exact_closed_since(exact, now_utc)
+    five_live = reset is not None and reset > now_utc
+
+    week_reset = _epoch_dt(exact.get("week_resets_at"))
+    # Weekly numbers hold until that week resets (or, unused, until a reading says otherwise).
+    week_current = week_reset is None or week_reset > now_utc
+    week_left = exact.get("week_remaining")
+    limited = (week_current and week_reset is not None
+               and isinstance(week_left, (int, float)) and week_left <= 0)
+
+    if limited:
+        is_active, status = True, "LIMITED"
+        reset_dt, window_hours = week_reset, GEMINI_WEEK_HOURS
+    elif five_live:
+        is_active, status = True, "ACTIVE"
+        reset_dt, window_hours = reset, CLAUDE_WINDOW_HOURS
+    else:
+        is_active = False
+        status = "EXPIRED" if (reset is not None or closed_since is not None) else "IDLE"
+        reset_dt, window_hours = reset, CLAUDE_WINDOW_HOURS
+    start_dt = reset_dt - timedelta(hours=window_hours) if reset_dt else None
+    remaining_sec = max(0, int((reset_dt - now_utc).total_seconds())) if is_active else 0
+
+    if is_active:
+        elapsed = (now_utc - start_dt).total_seconds()
+        progress_pct = min(100, max(0, int((elapsed / (window_hours * 3600)) * 100)))
+    else:
+        progress_pct = 100 if status == "EXPIRED" else 0
+
+    return {
+        "tool": "gemini",
+        "has_data": bool(exact) and (reset is not None or closed_since is not None or limited),
+        "is_active": is_active,
+        "status": status,
+        "source": exact.get("source") or "usage-api",
+        # A held account waits for the weekly reset; when that week began matters little.
+        "window_start": _fmt_local(start_dt) if not limited else "N/A",
+        "window_reset": _fmt_local(reset_dt) if not limited else _fmt_local_day(reset_dt),
+        "reset_epoch": reset_dt.timestamp() if reset_dt else None,
+        "latest_interaction": "N/A",
+        "time_remaining": _fmt_remaining(remaining_sec, is_active),
+        "remaining_seconds": remaining_sec,
+        "progress_pct": progress_pct,
+        # A closed window's share no longer applies; "no window open" means none used.
+        "session_used_pct": exact.get("used_pct") if (five_live or closed_since is not None) else None,
+        "week_used_pct": exact.get("week_used_pct") if week_current else None,
+        "week_reset": _fmt_local_day(week_reset) if week_current else "N/A",
+        "limits_as_of": _fmt_local(_epoch_dt(exact.get("as_of"))),
+        "total_events": 0,
+        "tokens": {"total": 0},
+    }
+
+
 def get_account_usage(tool, home=None, exact=None, allow_live_cli=True, force=False):
     """
     The 5-hour window of one account directory. Never raises: a failed read
     comes back as an ERROR reading, which callers treat as "do not warm".
     """
     exact_key = tuple(sorted(exact.items())) if isinstance(exact, dict) else str(exact)
-    cache_key = (tool, str(home) if home is not None else None, exact_key, bool(allow_live_cli))
+    cache_key = (tool, str(home) if home is not None else None, bool(allow_live_cli))
 
     now = time.time()
     if not force:
         with _USAGE_CACHE_LOCK:
             cached = _USAGE_CACHE.get(cache_key)
-            if cached and (now - cached[0] < USAGE_CACHE_TTL_SEC):
-                return dict(cached[1])
+            if cached and cached[1] == exact_key and (now - cached[0] < USAGE_CACHE_TTL_SEC):
+                return dict(cached[2])
 
     try:
         if tool == "claude":
             res = get_claude_actual_usage(home, exact=exact, allow_live_cli=allow_live_cli)
+        elif tool == "gemini":
+            res = get_gemini_actual_usage(exact)
         else:
             res = get_codex_actual_usage(home)
     except Exception as e:  # never let a telemetry read crash a caller's UI loop
         res = _error_state(tool, e)
 
     with _USAGE_CACHE_LOCK:
-        _USAGE_CACHE[cache_key] = (now, dict(res))
+        _USAGE_CACHE[cache_key] = (now, exact_key, dict(res))
 
     return res
 
