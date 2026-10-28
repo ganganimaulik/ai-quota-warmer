@@ -2284,7 +2284,8 @@ def fetch_claude_usage(account=None, custom_path=None, timeout=60):
     answer returns None and the caller keeps its previous reading.
 
     Returns {"resets_at": epoch, "used_pct": ..., "week_used_pct": ...,
-    "source": "usage-api"}, where resets_at is None when no window is open.
+    "week_resets_at": epoch, "source": "usage-api"}, where resets_at is None
+    when no window is open (week_resets_at when no week is).
     """
     account = account or Account("claude")
     claude_bin = find_claude_binary(custom_path)
@@ -2327,6 +2328,7 @@ def fetch_claude_usage(account=None, custom_path=None, timeout=60):
             "resets_at": resets_at,
             "used_pct": five.get("utilization"),
             "week_used_pct": week.get("utilization"),
+            "week_resets_at": _iso_to_epoch(week["resets_at"]) if week.get("resets_at") else None,
             "source": "usage-api",
         }
     return None
@@ -2607,7 +2609,9 @@ def _print_account_usage(acc, data, state):
         print(f"    Active Window     : {data['window_start']} -> Resets at {data['window_reset']}")
         print(f"    Countdown         : {data['time_remaining']} remaining ({data['progress_pct']}% elapsed)")
         if data.get("session_used_pct") is not None:
-            print(f"    5h Quota Used     : {data['session_used_pct']}%   (weekly: {data.get('week_used_pct')}%)")
+            print(f"    5h Quota Used     : {data['session_used_pct']}%")
+        if data.get("week_used_pct") is not None:
+            print(f"    Weekly Quota Used : {data['week_used_pct']}%   (resets {data.get('week_reset')})")
         print(f"    Prompts in 5h     : {data['user_prompts']} user prompts ({data['total_events']} total events)")
         tok = data["tokens"]
         print(f"    Tokens Consumed   : {tok['total']:,} total "
@@ -2619,8 +2623,9 @@ def _print_account_usage(acc, data, state):
         print(f"    Active Window     : {data['window_start']} -> Resets at {data['window_reset']}")
         print(f"    Countdown         : {data['time_remaining']} remaining ({data['progress_pct']}% elapsed)")
         if data.get("session_used_pct") is not None:
-            print(f"    5h Quota Used     : {data['session_used_pct']}%   "
-                  f"(weekly: {data.get('week_used_pct')}%)  as of {data.get('limits_as_of')}")
+            print(f"    5h Quota Used     : {data['session_used_pct']}%   as of {data.get('limits_as_of')}")
+        if data.get("week_used_pct") is not None:
+            print(f"    Weekly Quota Used : {data['week_used_pct']}%   (resets {data.get('week_reset')})")
         print(f"    Turns in 5h       : {data['turns_in_5h']} turns")
         print(f"    Tokens Used       : {data['tokens']['total']:,} tokens")
     _print_backoff(acc.key, state)

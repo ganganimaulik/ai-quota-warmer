@@ -138,6 +138,11 @@ The status line shows which source you're looking at: `usage-api`, `rate-limit-e
 `warm-up` is the one a warm-up opened when the read right after it failed (it assumes the
 window opened then). The next read replaces it.
 
+**Quota meters.** Each dashboard card shows how much of the 5-hour and of the weekly quota is used,
+each with its reset time: Claude's from the same per-minute usage read, Codex's from its session
+logs (picked by length, so a plan without one of them, such as ChatGPT Go, shows none) and Gemini's
+from `agy -p /usage`. A meter turns amber past 75% and rose past 90%.
+
 **Gemini details.** In Antigravity, Gemini Flash and Pro share one 5-hour and one weekly limit.
 Claude and GPT models run through `agy` have their own pair, which the warmer leaves alone.
 Warm-ups use the newest Gemini Flash at low effort (`--gemini-model flash-low`), about 0.05% of

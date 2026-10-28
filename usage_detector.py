@@ -214,6 +214,18 @@ def _fmt_local(dt):
     return dt.astimezone().strftime("%I:%M:%S %p") if dt else "N/A"
 
 
+def _fmt_local_day(dt):
+    # Weekly resets are at most seven days out, so the weekday is enough.
+    return dt.astimezone().strftime("%a %I:%M %p") if dt else "N/A"
+
+
+def _epoch_dt(value):
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def _cluster_windows(events, window_hours):
     """
     Groups chronologically sorted (dt, obj) events into rolling windows.
@@ -472,6 +484,24 @@ def _exact_closed_since(exact, now_utc):
     return as_of
 
 
+def _reported_week(exact, now_utc):
+    """
+    The weekly share in Claude Code's latest usage read ({"week_used_pct",
+    "week_resets_at", "as_of", ...}) as (used %, reset), or (None, None) once
+    it no longer applies: its week has reset since, or the read is older than
+    the lookback.
+    """
+    if not isinstance(exact, dict) or exact.get("week_used_pct") is None:
+        return None, None
+    as_of = _epoch_dt(exact.get("as_of"))
+    reset = _epoch_dt(exact.get("week_resets_at"))
+    if as_of is None or as_of < now_utc - timedelta(hours=LOOKBACK_HOURS):
+        return None, None
+    if reset is not None and reset <= now_utc:
+        return None, None
+    return exact["week_used_pct"], reset
+
+
 def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
     """
     Detects the Claude Code 5-hour rolling window of one config directory.
@@ -586,6 +616,18 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
 
     # Quota percentages come with the per-minute usage read, not with warm-ups.
     reported = exact if (isinstance(exact, dict) and source == exact_source) else {}
+    # The 5-hour share holds while the read's window runs, or when it found none open.
+    if live_cli:
+        five_used, five_reset = live_cli.get("session_used_pct"), live_cli.get("session_reset_dt")
+    elif reported and (is_active or closed_since is not None):
+        five_used, five_reset = reported.get("used_pct"), (reset_dt_local if is_active else None)
+    else:
+        five_used = five_reset = None
+    # The weekly share holds until its week resets, whichever 5-hour window is shown.
+    week_used, week_reset = (
+        (live_cli.get("week_used_pct"), live_cli.get("week_reset_dt")) if live_cli
+        else _reported_week(exact, now_utc)
+    )
 
     return {
         "tool": "claude",
@@ -600,8 +642,10 @@ def get_claude_actual_usage(config_dir=None, exact=None, allow_live_cli=True):
         "time_remaining": _fmt_remaining(remaining_sec, is_active),
         "remaining_seconds": remaining_sec,
         "progress_pct": progress_pct,
-        "session_used_pct": live_cli.get("session_used_pct") if live_cli else reported.get("used_pct"),
-        "week_used_pct": live_cli.get("week_used_pct") if live_cli else reported.get("week_used_pct"),
+        "session_used_pct": five_used,
+        "session_reset": _fmt_local(five_reset),
+        "week_used_pct": week_used,
+        "week_reset": _fmt_local_day(week_reset),
         "week_reset_raw": live_cli.get("week_reset_raw", "") if live_cli else "",
         "user_prompts": user_prompts,
         "total_events": len(window_events),
@@ -689,6 +733,22 @@ def _latest_codex_rate_limits(events):
     return None, None
 
 
+CODEX_WEEK_MINUTES = 7 * 24 * 60
+
+
+def _codex_limit(rate_limits, window_minutes):
+    """
+    The limit of a given length in a Codex `rate_limits` block, or {}. The
+    5-hour one is usually `primary` and the weekly one `secondary`, but not
+    every plan has both (ChatGPT Go's only limit spans 30 days), so they are
+    picked by length.
+    """
+    for limit in ((rate_limits or {}).get("primary"), (rate_limits or {}).get("secondary")):
+        if isinstance(limit, dict) and limit.get("window_minutes") == window_minutes:
+            return limit
+    return {}
+
+
 def get_codex_actual_usage(home=None):
     """
     Reports the Codex 5-hour rolling window of one CODEX_HOME.
@@ -719,7 +779,13 @@ def get_codex_actual_usage(home=None):
 
     rl_dt, rate_limits = _latest_codex_rate_limits(all_events)
     primary = (rate_limits or {}).get("primary") or {}
-    secondary = (rate_limits or {}).get("secondary") or {}
+    five = _codex_limit(rate_limits, int(CLAUDE_WINDOW_HOURS * 60))
+    five_reset = _epoch_dt(five.get("resets_at"))
+    week = _codex_limit(rate_limits, CODEX_WEEK_MINUTES)
+    week_reset = _epoch_dt(week.get("resets_at"))
+    # The 5-hour share holds while that window runs, the weekly one until its week resets.
+    five_current = five_reset is not None and five_reset > now_utc
+    week_current = week_reset is None or week_reset > now_utc
 
     window_hours = CLAUDE_WINDOW_HOURS
     source = "session-logs"
@@ -785,8 +851,10 @@ def get_codex_actual_usage(home=None):
         "time_remaining": _fmt_remaining(remaining_sec, is_active),
         "remaining_seconds": remaining_sec,
         "progress_pct": progress_pct,
-        "session_used_pct": primary.get("used_percent"),
-        "week_used_pct": secondary.get("used_percent"),
+        "session_used_pct": five.get("used_percent") if five_current else None,
+        "session_reset": _fmt_local(five_reset) if five_current else "N/A",
+        "week_used_pct": week.get("used_percent") if week_current else None,
+        "week_reset": _fmt_local_day(week_reset) if week_current else "N/A",
         "limits_as_of": _fmt_local(rl_dt),
         "plan_type": (rate_limits or {}).get("plan_type"),
         "turns_in_5h": turns,
@@ -800,18 +868,6 @@ def get_codex_actual_usage(home=None):
 # --------------------------------------------------------------------------
 
 GEMINI_WEEK_HOURS = 7 * 24
-
-
-def _epoch_dt(value):
-    try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
-def _fmt_local_day(dt):
-    # Weekly resets are at most seven days out, so the weekday is enough.
-    return dt.astimezone().strftime("%a %I:%M %p") if dt else "N/A"
 
 
 def get_gemini_actual_usage(exact=None):
@@ -874,6 +930,7 @@ def get_gemini_actual_usage(exact=None):
         "progress_pct": progress_pct,
         # A closed window's share no longer applies; "no window open" means none used.
         "session_used_pct": exact.get("used_pct") if (five_live or closed_since is not None) else None,
+        "session_reset": _fmt_local(reset) if five_live else "N/A",
         "week_used_pct": exact.get("week_used_pct") if week_current else None,
         "week_reset": _fmt_local_day(week_reset) if week_current else "N/A",
         "limits_as_of": _fmt_local(_epoch_dt(exact.get("as_of"))),
@@ -945,7 +1002,9 @@ def _error_state(tool, exc):
         "remaining_seconds": 0,
         "progress_pct": 0,
         "session_used_pct": None,
+        "session_reset": "N/A",
         "week_used_pct": None,
+        "week_reset": "N/A",
         "user_prompts": 0,
         "turns_in_5h": 0,
         "total_events": 0,

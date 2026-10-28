@@ -688,6 +688,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .codex-card .progress-fill { background: linear-gradient(90deg, #06b6d4, #38bdf8); }
     .gemini-card .progress-fill { background: linear-gradient(90deg, #4c8dff, #a3c4ff); }
 
+    /* Quota meters: each track is a tint of its fill, which turns amber, then rose, as the quota runs out */
+    .quota-box {
+      background: var(--bg-card-sub);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .quota-meter { display: flex; flex-direction: column; gap: 8px; }
+    .quota-meter + .quota-meter { border-top: 1px solid var(--border-color); padding-top: 12px; }
+    .quota-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+
+    .quota-head span {
+      color: var(--text-dim);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .quota-head strong { font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+    .quota-foot { color: var(--text-muted); font-size: 12px; }
+    .quota-foot:empty { display: none; }
+    .quota-track { height: 8px; border-radius: 10px; overflow: hidden; }
+    .quota-fill { height: 100%; border-radius: 10px; }
+
+    .claude-card .quota-track { background: rgba(168, 85, 247, 0.16); }
+    .claude-card .quota-fill { background: var(--accent-claude); }
+    .codex-card .quota-track { background: rgba(6, 182, 212, 0.16); }
+    .codex-card .quota-fill { background: var(--accent-codex); }
+    .gemini-card .quota-track { background: rgba(76, 141, 255, 0.16); }
+    .gemini-card .quota-fill { background: var(--accent-gemini); }
+    .quota-meter.unknown .quota-track { background: rgba(255, 255, 255, 0.05); }
+    .quota-meter.warn .quota-track { background: rgba(245, 158, 11, 0.16); }
+    .quota-meter.warn .quota-fill { background: var(--accent-amber); }
+    .quota-meter.critical .quota-track { background: rgba(244, 63, 94, 0.16); }
+    .quota-meter.critical .quota-fill { background: var(--accent-rose); }
+
     /* Key-Value Metrics Grid */
     .metrics-grid {
       display: grid;
@@ -1050,6 +1091,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="sub">Detecting actual 5h window...</div>
       </div>
       <div class="progress-container"><div class="progress-fill" style="width: 0%;"></div></div>
+      <div class="quota-box">
+        <div class="quota-meter unknown">
+          <div class="quota-head"><span>5H QUOTA</span><strong class="q-value">N/A</strong></div>
+          <div class="quota-track"><div class="quota-fill" style="width: 0%;"></div></div>
+          <div class="quota-foot">No 5-hour reading</div>
+        </div>
+        <div class="quota-meter unknown">
+          <div class="quota-head"><span>WEEKLY QUOTA</span><strong class="q-value">N/A</strong></div>
+          <div class="quota-track"><div class="quota-fill" style="width: 0%;"></div></div>
+          <div class="quota-foot">No weekly reading</div>
+        </div>
+      </div>
       <div class="metrics-grid">
         <div class="metric-cell"><span>5H WINDOW START</span><strong class="m-start">N/A</strong></div>
         <div class="metric-cell"><span>FULL QUOTA RESETS AT</span><strong class="m-reset">N/A</strong></div>
@@ -1105,13 +1158,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
-    // Per tool: card icon and the labels of the two bottom metrics. agy keeps
-    // no local activity log, so Gemini shows its quota shares instead.
+    // Per tool: card icon and the labels of the bottom metrics. agy keeps no
+    // local activity log, so Gemini shows when its quota was read instead.
     const TOOL_UI = {
       claude: { icon: '🟣', count: 'USER PROMPTS IN 5H', tokens: 'TOTAL TOKENS USED' },
       codex: { icon: '🤖', count: 'TURNS IN 5H', tokens: 'TOKENS IN SESSION' },
-      gemini: { icon: '✨', count: '5H QUOTA USED', tokens: 'WEEKLY QUOTA USED' },
+      gemini: { icon: '✨', count: 'QUOTA READ AT', tokens: '' },
     };
+
+    function meterNodes(el) {
+      const foot = el.querySelector('.quota-foot');
+      // The skeleton's footer is the text shown while there is no reading.
+      return { el, foot, empty: foot.textContent, value: el.querySelector('.q-value'), fill: el.querySelector('.quota-fill') };
+    }
 
     function buildCards(accounts) {
       const wrap = document.getElementById('accountCards');
@@ -1126,6 +1185,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         card.querySelector('.acc-label').textContent = acc.label;
         card.querySelector('.m-count-label').textContent = ui.count;
         card.querySelector('.m-tokens-label').textContent = ui.tokens;
+        card.querySelector('.m-tokens').parentElement.hidden = !ui.tokens;
+        const [fiveMeter, weekMeter] = [...card.querySelectorAll('.quota-meter')].map(meterNodes);
         const btn = card.querySelector('.warm-btn');
         btn.classList.add(`btn-${acc.tool}`);
         btn.textContent = `${ui.icon} Warm Up ${acc.label}`;
@@ -1141,6 +1202,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           badgeText: card.querySelector('.badge-text'),
           digits: card.querySelector('.digits'),
           progressFill: card.querySelector('.progress-fill'),
+          fiveMeter,
+          weekMeter,
           mStart: card.querySelector('.m-start'),
           mReset: card.querySelector('.m-reset'),
           mTokens: card.querySelector('.m-tokens'),
@@ -1186,6 +1249,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       const progressPct = (d.progress_pct || 0) + '%';
       if (node.progressFill.style.width !== progressPct) node.progressFill.style.width = progressPct;
+      renderMeter(node.fiveMeter, d.session_used_pct, d.session_reset);
+      renderMeter(node.weekMeter, d.week_used_pct, d.week_reset);
 
       const start = d.window_start || 'N/A';
       if (node.mStart.textContent !== start) node.mStart.textContent = start;
@@ -1195,8 +1260,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       let count, tokens;
       if (acc.tool === 'gemini') {
-        count = pctText(d.session_used_pct);
-        tokens = pctText(d.week_used_pct) + (d.week_reset && d.week_reset !== 'N/A' ? ` · resets ${d.week_reset}` : '');
+        count = d.limits_as_of || 'N/A';
+        tokens = '';
       } else {
         count = acc.tool === 'claude'
           ? `${d.user_prompts || 0} prompts (${d.total_events || 0} events)`
@@ -1229,6 +1294,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return (v === null || v === undefined) ? 'N/A' : `${v}%`;
     }
 
+    // Past 75% a quota meter turns amber and past 90% rose; the footer says so
+    // too, so that state never rests on color alone.
+    function renderMeter(m, pct, reset) {
+      const known = pct !== null && pct !== undefined;
+      const level = !known ? 'unknown' : pct >= 90 ? 'critical' : pct >= 75 ? 'warn' : '';
+      const cls = level ? `quota-meter ${level}` : 'quota-meter';
+      if (m.el.className !== cls) m.el.className = cls;
+
+      const value = known ? `${pctText(pct)} used` : 'N/A';
+      if (m.value.textContent !== value) m.value.textContent = value;
+
+      const width = (known ? Math.min(100, Math.max(0, pct)) : 0) + '%';
+      if (m.fill.style.width !== width) m.fill.style.width = width;
+
+      const state = level === 'critical' ? (pct >= 100 ? '⛔ Used up' : '⛔ Almost used up')
+        : level === 'warn' ? '⚠️ Running low' : '';
+      const resets = reset && reset !== 'N/A' ? `resets ${reset}` : '';
+      let foot = known ? [state, resets].filter(Boolean).join(' · ') : m.empty;
+      foot = foot.charAt(0).toUpperCase() + foot.slice(1);
+      if (m.foot.textContent !== foot) m.foot.textContent = foot;
+    }
+
     function subText(d, cooldown, failures) {
       let sub;
       if (d.status === 'ERROR') {
@@ -1236,9 +1323,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       } else if (d.status === 'LIMITED') {
         sub = `Weekly limit used up · resets ${d.week_reset}. Auto-warm waits for it, so no AI credits are spent.`;
       } else if (d.is_active) {
-        const quota = (d.session_used_pct !== null && d.session_used_pct !== undefined)
-          ? `Quota ${d.session_used_pct}% used · ` : '';
-        sub = `${quota}Active 5h window (${d.progress_pct}% elapsed) · via ${d.source}`;
+        sub = `Active 5h window (${d.progress_pct}% elapsed) · via ${d.source}`;
       } else if (failures > 0) {
         sub = `Window reset. Last ${failures} warm-up(s) failed — retry in ${Math.ceil(cooldown / 60)}m.`;
       } else if (cooldown > 0) {
