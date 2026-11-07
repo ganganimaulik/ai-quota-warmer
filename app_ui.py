@@ -1819,6 +1819,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
+class DashboardServer(ThreadingHTTPServer):
+    """
+    ThreadingHTTPServer, not HTTPServer: a warm-up can block for a minute, and a
+    single-threaded server would freeze the whole dashboard until it returned.
+    """
+
+    # HTTPServer turns SO_REUSEADDR on, and on Windows that lets a second
+    # dashboard bind the port this one serves instead of failing - which of the
+    # two then answers is undefined. Windows rebinds a port in TIME_WAIT without it.
+    allow_reuse_address = sys.platform != "win32"
+
+
 def run_server():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1827,10 +1839,8 @@ def run_server():
 
     url = f"http://{HOST}:{PORT}"
 
-    # ThreadingHTTPServer, not HTTPServer: a warm-up can block for a minute, and
-    # a single-threaded server would freeze the whole dashboard until it returned.
     try:
-        httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
+        httpd = DashboardServer((HOST, PORT), DashboardHandler)
     except OSError as e:
         print(f"[-] Could not bind {url}: {e}")
         print("    Another AI Quota Warmer dashboard is probably already running.")
