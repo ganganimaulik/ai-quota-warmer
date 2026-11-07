@@ -44,6 +44,9 @@ from quota_warmer import (
     uninstall_startup_autorun,
     install_scheduled_task,
     uninstall_scheduled_task,
+    set_daily_start,
+    describe_daily_start,
+    schedule_status,
     SingleInstanceLock,
 )
 from usage_detector import invalidate_usage_cache
@@ -133,6 +136,7 @@ def get_dashboard_state(force=False):
             for acc in accounts
         ],
         "startup_autorun": is_startup_installed(),
+        "schedule": schedule_status(),
         "adaptive_auto_warm": ADAPTIVE_AUTO_WARM_ENABLED,
         "watcher_active": WATCHER_ACTIVE,
         "triggers_count": len(triggers),
@@ -391,6 +395,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 new_state = ADAPTIVE_AUTO_WARM_ENABLED
             push_event(f"Adaptive auto-warm {'ENABLED' if new_state else 'DISABLED'}.", "info")
             self.send_json({"adaptive_auto_warm": new_state})
+            return
+
+        if path == "/api/schedule":
+            try:
+                start = set_daily_start(payload.get("daily_start"))
+            except ValueError as e:
+                self.send_json({"error": str(e)}, status=400)
+                return
+            except OSError as e:
+                self.send_json({"error": f"Could not save the daily start: {e}"}, status=500)
+                return
+            message = describe_daily_start(start)
+            push_event(message, "info")
+            self.send_json({"schedule": schedule_status(), "message": message})
             return
 
         if path == "/api/schedule-task":
@@ -861,6 +879,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     input:checked + .slider { background-color: #6366f1; }
     input:checked + .slider:before { transform: translateX(20px); }
 
+    /* Daily start: the picked time, then the warm-ups it gives */
+    .schedule-bar {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 14px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 18px;
+    }
+
+    .schedule-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .schedule-pick label { font-size: 13px; font-weight: 600; }
+    .schedule-pick input { color-scheme: dark; font-family: 'JetBrains Mono', monospace; }
+    .schedule-times { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .schedule-times:empty { display: none; }
+    #scheduleNote { flex-basis: 100%; }
+
+    .time-chip {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      padding: 3px 9px;
+      border-radius: 20px;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid var(--border-highlight);
+    }
+
+    .time-chip.first { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+    .chip-arrow { color: var(--text-dim); font-size: 12px; }
+
     /* Terminal Console */
     .console-card {
       background: #06090e;
@@ -1057,6 +1106,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Daily start: the day's first warm-up, the rest every 5 hours -->
+    <div class="schedule-bar">
+      <div class="schedule-pick">
+        <label for="dailyStart">🕖 Daily start</label>
+        <input type="time" class="field" id="dailyStart" oninput="renderSchedule()"
+               onkeydown="if (event.key === 'Enter') savePicked()">
+        <button class="btn btn-primary btn-sm" id="btnScheduleSave" onclick="savePicked()">Save</button>
+        <button class="btn btn-secondary btn-sm" id="btnScheduleOff" onclick="saveSchedule(null)" hidden>Turn off</button>
+      </div>
+      <div class="schedule-times" id="scheduleTimes"></div>
+      <p class="muted" id="scheduleNote"></p>
+    </div>
+
     <!-- Live Console Output -->
     <div class="console-card" id="consoleOutput">
       <div class="console-line info">[System] Actual 5-Hour Limit Detector active. Monitoring every configured account.</div>
@@ -1071,6 +1133,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     let cardKeys = null;
     let busy = false;
     let lastEventKey = '';
+    let schedule = { daily_start: null, window_minutes: 300 };  // the saved daily start, from the server
+    let startupOn = false;
 
     // Static skeleton only - account names, paths and readings go in through
     // textContent so nothing from disk is ever parsed as HTML.
@@ -1324,6 +1388,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         sub = `Weekly limit used up · resets ${d.week_reset}. Auto-warm waits for it, so no AI credits are spent.`;
       } else if (d.is_active) {
         sub = `Active 5h window (${d.progress_pct}% elapsed) · via ${d.source}`;
+      } else if (schedule.held_until) {
+        sub = `Window reset. Next warm-up at the ${clockText(clockMinutes(schedule.daily_start))} daily start.`;
       } else if (failures > 0) {
         sub = `Window reset. Last ${failures} warm-up(s) failed — retry in ${Math.ceil(cooldown / 60)}m.`;
       } else if (cooldown > 0) {
@@ -1340,6 +1406,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('chkAutoWarm').checked = !!data.adaptive_auto_warm;
       document.getElementById('watcherState').textContent =
         data.watcher_active ? '(watching)' : '(handled by background daemon)';
+      syncSchedule(data);  // before the cards: their text says when a held warm-up comes
 
       // Rebuild only when the account list changes (e.g. one was added from the CLI).
       const accounts = data.accounts || [];
@@ -1435,6 +1502,97 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       } catch (err) {
         log('Schedule error: ' + err.message, 'error');
       }
+      fetchStatus();
+    }
+
+    // -- Daily start: the day's first warm-up, the rest a window apart -----
+
+    function clockMinutes(hhmm) {
+      const [h, m] = hhmm.split(':').map(Number);
+      return h * 60 + m;
+    }
+
+    // In the browser's own time format, the one its time picker shows.
+    function clockText(minutes) {
+      const m = ((minutes % 1440) + 1440) % 1440;
+      return new Date(2000, 0, 1, Math.floor(m / 60), m % 60)
+        .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    }
+
+    // As daily_warm_times() in quota_warmer.py: each window ends by the next day's start.
+    function warmTimes(start) {
+      const first = clockMinutes(start), step = schedule.window_minutes;
+      const times = [];
+      for (let m = first; m + step <= first + 1440; m += step) times.push(m);
+      return times;
+    }
+
+    function syncSchedule(data) {
+      const input = document.getElementById('dailyStart');
+      const next = data.schedule || { daily_start: null, window_minutes: 300 };
+      // Follow the saved time (it may have been set from the CLI), unless a new one is being picked.
+      if (document.activeElement !== input && input.value === (schedule.daily_start || '')) {
+        input.value = next.daily_start || '';
+      }
+      schedule = next;
+      startupOn = !!data.startup_autorun;
+      renderSchedule();
+    }
+
+    // The picked time's warm-ups, shown before it is saved too.
+    function renderSchedule() {
+      const picked = document.getElementById('dailyStart').value;  // 'HH:MM', or '' when cleared
+      const saved = schedule.daily_start;
+      const times = document.getElementById('scheduleTimes');
+      times.textContent = '';
+      (picked ? warmTimes(picked) : []).forEach((m, i) => {
+        if (i) {
+          const arrow = document.createElement('span');
+          arrow.className = 'chip-arrow';
+          arrow.textContent = '→';
+          times.appendChild(arrow);
+        }
+        const chip = document.createElement('span');
+        chip.className = i ? 'time-chip' : 'time-chip first';
+        chip.textContent = clockText(m);
+        times.appendChild(chip);
+      });
+
+      let note;
+      if (!picked) {
+        note = 'Off: each account is warmed the moment its window resets, at any hour. '
+          + 'Pick when the day\'s first warm-up should happen; the rest follow every 5 hours.';
+      } else {
+        const start = clockMinutes(picked);
+        const from = clockText(start - schedule.window_minutes), at = clockText(start);
+        if (picked === saved && schedule.held_until) {
+          note = `Holding warm-ups until ${at}: none start from ${from}, so the ${at} window can start on time.`;
+        } else {
+          note = `None start from ${from} until ${at}, so the ${at} window can start on time.`;
+          if (picked !== saved) note += ' Not saved yet.';
+          else if (!startupOn) note += ' Turn on Auto-Run on PC Restart to keep this schedule while this page is closed.';
+        }
+      }
+      document.getElementById('scheduleNote').textContent = note;
+      document.getElementById('btnScheduleSave').disabled = !picked || picked === saved;
+      document.getElementById('btnScheduleOff').hidden = !saved;
+    }
+
+    function savePicked() {
+      const picked = document.getElementById('dailyStart').value;
+      if (picked && picked !== schedule.daily_start) saveSchedule(picked);
+    }
+
+    async function saveSchedule(value) {
+      try {
+        const data = await post('/api/schedule', { daily_start: value });
+        schedule = data.schedule;
+        document.getElementById('dailyStart').value = schedule.daily_start || '';
+        log(data.message, 'success');
+      } catch (err) {
+        log('Daily start error: ' + err.message, 'error');
+      }
+      renderSchedule();
       fetchStatus();
     }
 

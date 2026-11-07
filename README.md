@@ -202,7 +202,8 @@ Two independent mechanisms — either is enough, and they are safe to combine:
 
 **1. Adaptive watcher (recommended).** `--install-startup` drops a silent `pythonw.exe`
 launcher into your Startup folder. On every login it runs `quota_warmer.py --loop`, which
-watches every account's window and fires a warm-up *the instant* one resets — no fixed schedule.
+watches every account's window and fires a warm-up *the instant* one resets — no fixed schedule,
+unless you pick a daily start (see **Daily Start Time** below).
 
 **2. Windows Scheduled Task.** `--install-task` registers a plain every-5-hours job.
 No admin rights needed.
@@ -216,6 +217,37 @@ Safety rails on both:
 - **Exponential backoff.** Consecutive failures back off 5m → 10m → 20m → 40m → 60m, so an
   expired login can never spawn an endless stream of CLI processes.
 - **Never warms blind.** If the detector itself errors, no warm-up fires.
+
+---
+
+## 🕖 Daily Start Time
+
+Left alone, the watcher warms each window the moment the previous one resets, so the windows
+keep the rhythm of whenever the first one happened to open. Pick a **daily start** to anchor
+them: the day's first warm-up happens at that time and the rest follow every 5 hours.
+
+| Daily start | Warm-ups | Nothing new starts |
+| :--- | :--- | :--- |
+| 07:00 | 07:00 → 12:00 → 17:00 → 22:00 | 02:00 – 07:00 |
+| 09:30 | 09:30 → 14:30 → 19:30 → 00:30 | 04:30 – 09:30 |
+
+Set it from the dashboard (**🕖 Daily start**, which shows the times while you pick one) or a terminal:
+
+```bash
+python quota_warmer.py --daily-start 07:00   # first warm-up at 07:00, then every 5 hours
+python quota_warmer.py --daily-start off     # back to warming whenever a window resets
+```
+
+- A day is not a whole number of 5-hour windows, so nothing new starts in the 5 hours before the
+  daily start: a window opened then would still be running at it. That is why a day has four
+  warm-ups, not five.
+- The rest of the day each account is still warmed the moment its window resets. If you open a
+  window yourself, or the PC was asleep at a warm-up time, the next warm-ups move with it until
+  the following daily start puts them back on time.
+- The watcher keeps the schedule: the Startup daemon (`--install-startup`), or the dashboard
+  while it is open. A running watcher picks up a change within about 15 seconds.
+- `--now`, and so the Scheduled Task, also waits out those 5 hours unless `--force` is given, so
+  neither opens a window that runs into the daily start. The task otherwise keeps its own times.
 
 ---
 
@@ -252,10 +284,11 @@ python quota_warmer.py [options]
   --claude-model / --codex-model / --gemini-model MODEL
                          Warm-up models (default: haiku / luna / flash-low, the newest
                          Gemini Flash at low effort; also flash-medium, pro-low, ... or an id)
-  --force                Ignore the cooldown for --now
+  --force                Ignore the cooldown and the daily start's pause for --now
   --status               Show real 5-hour windows, quota %, and history
   --list-accounts        Who each account is signed in as, free (alias: --check-login)
   --loop                 Run the adaptive watcher in the foreground
+  --daily-start HH:MM    Time of the day's first warm-up, the rest every 5 hours ('off' to clear)
 
   --add-account TOOL [NAME] [--dir PATH]       Add an account and open its sign-in
                                                (NAME defaults to "default", the CLI's own login)
@@ -285,6 +318,7 @@ and `AQW_CLAUDE_MODEL` / `AQW_CODEX_MODEL` / `AQW_GEMINI_MODEL` for the model de
 | `~/.ai_quota_warmer/accounts.json` | Registered accounts (absent = just the two default accounts) |
 | `~/.ai_quota_warmer/history.json` | Last 100 trigger results (atomic writes) |
 | `~/.ai_quota_warmer/state.json` | Per-account cooldown, failure counters and the last exact Claude and Gemini windows |
+| `~/.ai_quota_warmer/settings.json` | The daily start, if one is set |
 | `~/.ai_quota_warmer/daemon.lock` | Single-instance lock held by the running watcher |
 | `~/.ai_quota_warmer/gemini-warmup/` | Empty working folder for the warmer's `agy` runs |
 | `~/.ai_quota_warmer/agy-warmup.log`, `agy-usage.log`, `agy-models.log` | Logs of the warmer's last `agy` warm-up, quota read and sign-in check (`agy-*-NAME.log` for added Gemini accounts) |

@@ -14,6 +14,8 @@ Features:
     user profile, with its sign-in kept in a file there.
   - Concurrently sends a minimal ping prompt ('hi') to every account.
   - Watches the real 5-hour windows and warms each account the moment it resets.
+  - Optional daily start: the day's first warm-up at a chosen time, the rest
+    following every 5 hours.
   - Persistent cooldown + exponential backoff so a broken login cannot cause a
     retry storm.
   - Single-instance locking so the startup daemon and the dashboard never
@@ -47,6 +49,7 @@ HISTORY_FILE = DATA_DIR / "history.json"
 STATE_FILE = DATA_DIR / "state.json"
 LOCK_FILE = DATA_DIR / "daemon.lock"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_PROMPT = "hi"
 DEFAULT_CLAUDE_MODEL = os.getenv("AQW_CLAUDE_MODEL", "haiku")
 DEFAULT_CODEX_MODEL = os.getenv("AQW_CODEX_MODEL", "luna")
@@ -153,6 +156,17 @@ def save_state(state):
             _write_json_atomic(STATE_FILE, state)
         except OSError:
             pass
+
+
+def load_settings():
+    """Choices every watcher follows, e.g. {"daily_start": "07:00"}."""
+    return _read_json(SETTINGS_FILE, {})
+
+
+def save_settings(settings):
+    # Unlike state, a failed write is reported: the user just asked for it.
+    with _FILE_LOCK:
+        _write_json_atomic(SETTINGS_FILE, settings)
 
 
 _SIGNIN_ERROR_RE = re.compile(
@@ -2548,6 +2562,13 @@ def print_status(accounts=None):
     print("=" * 70)
     print(f"  Current Time              : {now.strftime('%Y-%m-%d %I:%M:%S %p')}")
     print(f"  Auto-Run on PC Restart    : {'[ENABLED - Runs on Boot]' if is_startup_installed() else '[DISABLED]'}")
+    start = get_daily_start()
+    if start:
+        holding = " [HOLDING NOW]" if schedule_hold(start) else ""
+        print(f"  Daily Start               : {start} -> warm-ups {', '.join(daily_warm_times(start))}; "
+              f"none {daily_pause_from(start)}-{start}{holding}")
+    else:
+        print("  Daily Start               : [OFF - each window is warmed the moment it resets]")
     print(f"  Accounts                  : {', '.join(a.key for a in accounts) or 'none'}")
     print("=" * 70)
 
@@ -2643,6 +2664,98 @@ def _print_backoff(key, state):
 
 
 # ---------------------------------------------------------------------------
+# Daily start
+# ---------------------------------------------------------------------------
+#
+# Left alone, the watcher warms each account the moment its window resets, so
+# the windows chain on from whenever the first one happened to open. A daily
+# start anchors that chain: the day's first warm-up happens then and the rest
+# follow a window apart (07:00 -> 12:00, 17:00, 22:00). A day is not a whole
+# number of windows, so nothing new is warmed in the window-length before the
+# start: a window opened then would still be running when the start came.
+
+def parse_daily_start(value):
+    """'7:30' or '07:30' -> '07:30'; '', 'off' or None -> None (no daily start)."""
+    text = str(value or "").strip().lower()
+    if text in ("", "off", "none"):
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise ValueError(f"'{value}' is not a time of day. Use HH:MM (e.g. 07:00), or 'off'.")
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def get_daily_start():
+    try:
+        return parse_daily_start(load_settings().get("daily_start"))
+    except ValueError:
+        return None
+
+
+def set_daily_start(value):
+    """Saves the daily start ('HH:MM', or None / 'off' to turn it off) and returns it normalized."""
+    start = parse_daily_start(value)
+    with _FILE_LOCK:
+        settings = load_settings()
+        settings["daily_start"] = start
+        save_settings(settings)
+    return start
+
+
+def _clock_minutes(hhmm):
+    hours, minutes = hhmm.split(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def _clock_text(minutes):
+    return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
+
+
+def daily_warm_times(start):
+    """The day's warm-ups, each window ending by the next day's start: '07:00' -> 07, 12, 17 and 22:00."""
+    first, step = _clock_minutes(start), int(QUOTA_WINDOW_HOURS * 60)
+    return [_clock_text(m) for m in range(first, first + 24 * 60 - step + 1, step)]
+
+
+def daily_pause_from(start):
+    """When warm-ups stop ahead of the daily start: '07:00' -> '02:00'."""
+    return _clock_text(_clock_minutes(start) - int(QUOTA_WINDOW_HOURS * 60))
+
+
+def describe_daily_start(start):
+    if not start:
+        return "Daily start off: each account is warmed the moment its window resets, at any hour."
+    return (f"Daily start {start}: warm-ups at {', '.join(daily_warm_times(start))}, "
+            f"none from {daily_pause_from(start)} until {start}.")
+
+
+def schedule_hold(start, now=None):
+    """
+    While warm-ups wait for the daily start `start` - the window-length before
+    it - the epoch they resume at. None the rest of the day, or without a start.
+    """
+    if not start:
+        return None
+    now = time.time() if now is None else now
+    hours, minutes = divmod(_clock_minutes(start), 60)
+    at = datetime.datetime.fromtimestamp(now).replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    if at.timestamp() <= now:
+        at += datetime.timedelta(days=1)
+    resume = at.timestamp()
+    return resume if resume - now <= QUOTA_WINDOW_HOURS * 3600 else None
+
+
+def schedule_status(now=None):
+    """The daily start as the dashboard shows it."""
+    start = get_daily_start()
+    status = {"daily_start": start, "window_minutes": int(QUOTA_WINDOW_HOURS * 60)}
+    if start:
+        status.update(times=daily_warm_times(start), pause_from=daily_pause_from(start),
+                      held_until=schedule_hold(start, now))
+    return status
+
+
+# ---------------------------------------------------------------------------
 # Adaptive watcher
 # ---------------------------------------------------------------------------
 
@@ -2702,6 +2815,9 @@ def report_signed_out(signed_out, notify=True, log=print):
                                       f"{reason} Sign in again from the dashboard to keep it warm.")
 
 
+_HOLD_LOGGED = None              # the daily start the watcher last said it was waiting for
+
+
 def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sleep=60.0,
                claude_model=None, codex_model=None, gemini_model=None):
     """
@@ -2714,13 +2830,23 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
     acted on promptly, and accounts that got signed out are reported.
     Otherwise the sleep ends shortly after the nearest reset or cooldown
     expiry, so an idle machine polls rarely but still fires within seconds of
-    a window opening.
+    a window opening. In the hours before a daily start nothing is warmed,
+    and the pass that ends them comes right at the start.
     """
+    global _HOLD_LOGGED
     cycle_start = time.time()
     report_signed_out(refresh_live_status(accounts), notify=notify, log=log)
     usage = get_all_usage(accounts)
     due = [a for a in accounts
            if not usage[a.key].get("is_active") and usage[a.key].get("status") != "ERROR"]
+    start = get_daily_start()
+    hold = schedule_hold(start)
+    if hold and due:
+        if _HOLD_LOGGED != hold:
+            _HOLD_LOGGED = hold
+            log(f"[{datetime.datetime.now():%I:%M:%S %p}] Holding warm-ups until the {start} daily start "
+                f"({', '.join(a.label for a in due)} waiting).")
+        due = []
     threads = [
         threading.Thread(target=warm_if_expired, args=(a, usage[a.key]),
                          kwargs={"prompt": prompt, "notify": notify, "log": log,
@@ -2746,6 +2872,8 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
             waits.append(cd + 5)
     if any(acc.tool == "claude" for acc in accounts):
         waits.append(USAGE_REFRESH_SEC - (time.time() - cycle_start))
+    if hold:
+        waits.append(hold - time.time() + 1)
 
     sleep_for = min(waits) if waits else float(idle_sleep)
     return max(15.0, min(sleep_for, 300.0))
@@ -2753,7 +2881,7 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
 
 def _watch_stamp():
     stamps = []
-    for path in (ACCOUNTS_FILE, STATE_FILE):
+    for path in (ACCOUNTS_FILE, STATE_FILE, SETTINGS_FILE):
         try:
             stamps.append(path.stat().st_mtime_ns)
         except OSError:
@@ -2763,10 +2891,10 @@ def _watch_stamp():
 
 def sleep_until_next_cycle(seconds, step=15.0):
     """
-    Sleeps between watcher passes, but wakes early when accounts.json or
-    state.json changes: an account added, removed or signed in again from
-    another window is acted on within seconds rather than after the current
-    (up to 5 minute) sleep.
+    Sleeps between watcher passes, but wakes early when accounts.json,
+    state.json or settings.json changes: an account added, removed or signed
+    in again from another window, or a new daily start, is acted on within
+    seconds rather than after the current (up to 5 minute) sleep.
     """
     stamp = _watch_stamp()
     deadline = time.time() + seconds
@@ -2805,6 +2933,9 @@ def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAU
     log(f"  Prompt  : '{prompt}'")
     log(f"  Models  : Claude='{c_model}', Codex='{x_model}', Gemini='{g_model}'")
     log("  Warm-up fires as soon as an account's 5-hour window resets.")
+    daily = get_daily_start()
+    if daily:
+        log(f"  {describe_daily_start(daily)}")
     log("  Press Ctrl+C to stop.")
     log("=" * 70 + "\n")
 
@@ -2826,6 +2957,9 @@ def run_smart_adaptive_monitor(check_interval_sec=60, target="all", prompt=DEFAU
                 if [a.key for a in accounts] != watching:
                     watching = [a.key for a in accounts]
                     log(f"[*] Now watching: {', '.join(a.label for a in accounts) or 'no accounts'}")
+                if get_daily_start() != daily:
+                    daily = get_daily_start()
+                    log(f"[*] {describe_daily_start(daily)}")
                 sleep_for = warm_cycle(accounts, prompt=prompt, notify=notify, log=log,
                                        idle_sleep=check_interval_sec,
                                        claude_model=c_model, codex_model=x_model, gemini_model=g_model)
@@ -2876,9 +3010,13 @@ def main():
     parser.add_argument("--check-login", "--list-accounts", dest="check_login", action="store_true",
                         help="List accounts and who each is logged in as (free - no prompt is sent)")
     parser.add_argument("--loop", action="store_true", help="Run the adaptive background watcher")
+    parser.add_argument("--daily-start", metavar="HH:MM",
+                        help="Time of the day's first warm-up; the next follow every 5 hours "
+                             "(07:00 -> 12:00, 17:00, 22:00). 'off' warms whenever a window resets")
     parser.add_argument("--interval", type=float, default=5.0, help="Interval in hours for the scheduled task (default: 5.0)")
     parser.add_argument("--no-notify", action="store_true", help="Disable Windows desktop notifications")
-    parser.add_argument("--force", action="store_true", help="Ignore the per-account cooldown for --now")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore the per-account cooldown and the daily start's pause for --now")
     parser.add_argument("--codex-path", default=None, help="Custom path to the codex executable")
     parser.add_argument("--claude-path", default=None, help="Custom path to the claude CLI")
     parser.add_argument("--agy-path", dest="gemini_path", default=None, metavar="PATH",
@@ -2917,6 +3055,9 @@ def main():
         return
     if args.remove_account:
         _cli_remove_account(args.remove_account)
+        return
+    if args.daily_start is not None:
+        _cli_daily_start(args.daily_start)
         return
     if args.login:
         acc = find_account(args.login)
@@ -2968,9 +3109,15 @@ def main():
                                    gemini_model=args.gemini_model)
         return
 
-    # Default action: warm now. Respects the backoff unless --force is given, so
-    # a Scheduled Task firing into a broken login cannot hammer the CLI.
+    # Default action: warm now. Respects the backoff and the daily start unless
+    # --force is given, so a Scheduled Task firing into a broken login cannot
+    # hammer the CLI, nor open a window that would run into the daily start.
     if not args.force:
+        start = get_daily_start()
+        if schedule_hold(start):
+            print(f"[*] Holding warm-ups until the {start} daily start: a window opened now would still "
+                  "be running then. Use --force to warm anyway.")
+            return
         state = load_state()
         blocked = [a for a in selected if cooldown_remaining(a.key, state) > 0]
         for a in blocked:
@@ -3030,6 +3177,18 @@ def _cli_add_account(args):
     elif not acc.is_default:
         var = _HOME_ENV[acc.tool]
         print(f"    To use this login yourself, set {var}={acc.home} before starting {acc.tool}.")
+
+
+def _cli_daily_start(value):
+    try:
+        start = set_daily_start(value)
+    except (ValueError, OSError) as e:
+        print(f"[-] {e}")
+        sys.exit(1)
+    print(f"[+] {describe_daily_start(start)}")
+    print("    A running watcher follows it within ~15 seconds - no restart needed.")
+    if start and not is_startup_installed():
+        print("    The watcher keeps this schedule; --install-startup runs it on every login.")
 
 
 def _cli_remove_account(spec):
