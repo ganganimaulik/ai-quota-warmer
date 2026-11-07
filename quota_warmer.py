@@ -1649,6 +1649,86 @@ def _kill_tree(proc):
         proc.kill()
 
 
+# The desktop the user sees. A new process opens its windows on its parent's
+# desktop, and a dashboard that a coding agent started can be on a hidden one:
+# the Antigravity agent runs its commands on a desktop of its own ("exebox-...").
+_USER_DESKTOP = "WinSta0\\Default"
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+
+
+class _ConsoleProcess:
+    """What the sign-in uses of a Popen, for a process _open_console_window() started."""
+
+    def __init__(self, args, handle, pid):
+        import ctypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._handle = ctypes.c_void_p(handle)
+        self.args, self.pid, self.returncode = args, pid, None
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            import ctypes
+            ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))  # INFINITE
+            if self._kernel32.WaitForSingleObject(self._handle, ctypes.c_ulong(ms)) != 0:  # WAIT_OBJECT_0
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            code = ctypes.c_ulong()
+            self._kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code))
+            self.returncode = code.value
+        return self.returncode
+
+    def poll(self):
+        try:
+            return self.wait(0)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def kill(self):
+        if self.poll() is None:
+            self._kernel32.TerminateProcess(self._handle, 1)
+
+    def __del__(self):
+        # Only here, not in wait(): the sign-in thread and cancel() both wait on it.
+        self._kernel32.CloseHandle(self._handle)
+
+
+def _open_console_window(cmd, cwd=None, env=None):
+    """
+    Starts `cmd` in a console window of its own on the user's desktop, like
+    Popen(cmd, creationflags=CREATE_NEW_CONSOLE) would on the desktop this
+    process runs on. Popen cannot choose the desktop, so this calls
+    CreateProcessW itself.
+    """
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("lpReserved", wt.LPWSTR), ("lpDesktop", wt.LPWSTR),
+                    ("lpTitle", wt.LPWSTR), ("dwX", wt.DWORD), ("dwY", wt.DWORD), ("dwXSize", wt.DWORD),
+                    ("dwYSize", wt.DWORD), ("dwXCountChars", wt.DWORD), ("dwYCountChars", wt.DWORD),
+                    ("dwFillAttribute", wt.DWORD), ("dwFlags", wt.DWORD), ("wShowWindow", wt.WORD),
+                    ("cbReserved2", wt.WORD), ("lpReserved2", ctypes.c_void_p),
+                    ("hStdInput", wt.HANDLE), ("hStdOutput", wt.HANDLE), ("hStdError", wt.HANDLE)]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", wt.HANDLE), ("hThread", wt.HANDLE),
+                    ("dwProcessId", wt.DWORD), ("dwThreadId", wt.DWORD)]
+
+    block = None
+    if env is not None:
+        # NAME=value strings sorted by name, each ending in a NUL, then a NUL ending the block.
+        text = "".join(f"{k}={v}\0" for k, v in sorted(env.items(), key=lambda kv: kv[0].upper())) + "\0"
+        block = ctypes.create_string_buffer(text.encode("utf-16-le"))
+    startup = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW), lpDesktop=_USER_DESKTOP)
+    info = PROCESS_INFORMATION()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.CreateProcessW(None, ctypes.create_unicode_buffer(subprocess.list2cmdline(cmd)), None, None,
+                                   False, subprocess.CREATE_NEW_CONSOLE | _CREATE_UNICODE_ENVIRONMENT, block,
+                                   cwd, ctypes.byref(startup), ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel32.CloseHandle(wt.HANDLE(info.hThread))
+    return _ConsoleProcess(cmd, info.hProcess, info.dwProcessId)
+
+
 class LoginJob:
     """
     One account's CLI sign-in, run in the background so a UI can drive it.
@@ -1695,7 +1775,8 @@ class LoginJob:
                 "accepts_code": self.account.tool == "claude", "detail": self.detail,
                 "login": self.login, "output": list(self.output),
                 "started_at": self.started_at, "finished_at": self.finished_at,
-                "hint": ("A window with the Antigravity CLI opened. " + _gemini_signin_steps(self.account)
+                "hint": ("A window with the Antigravity CLI opened (if it is behind this browser, find it "
+                         "in the taskbar). " + _gemini_signin_steps(self.account)
                          if self.account.tool == "gemini" else None),
             }
 
@@ -1798,9 +1879,9 @@ class LoginJob:
     def _run_in_console(self, cmd):
         """
         agy signs in from its interactive screen, which needs a real terminal,
-        so it runs in a console window of its own rather than behind pipes.
-        The sign-in is checked once that window closes - or, for a new added
-        account, as soon as agy saved a sign-in in its folder.
+        so it runs in a console window of its own on the user's desktop rather
+        than behind pipes. The sign-in is checked once that window closes - or,
+        for a new added account, as soon as agy saved a sign-in in its folder.
         """
         acc = self.account
         if not _IS_WINDOWS:
@@ -1813,8 +1894,7 @@ class LoginJob:
                 return
         opened = time.time()
         try:
-            proc = subprocess.Popen(cmd, cwd=_gemini_workdir(), env=env,
-                                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+            proc = _open_console_window(cmd, cwd=_gemini_workdir(), env=env)
         except (OSError, ValueError) as e:
             return self._end("failed", f"Could not start the Antigravity CLI: {e}")
         with self._lock:
