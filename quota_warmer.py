@@ -14,6 +14,8 @@ Features:
     user profile, with its sign-in kept in a file there.
   - Concurrently sends a minimal ping prompt ('hi') to every account.
   - Watches the real 5-hour windows and warms each account the moment it resets.
+    A warm-up never lands inside a window that is still open, and the
+    Scheduled Task, too, runs just after each reset rather than at fixed times.
   - Optional daily start: the day's first warm-up at a chosen time, the rest
     following every 5 hours.
   - Persistent cooldown + exponential backoff so a broken login cannot cause a
@@ -58,6 +60,9 @@ DEFAULT_CODEX_MODEL = os.getenv("AQW_CODEX_MODEL", "luna")
 DEFAULT_GEMINI_MODEL = os.getenv("AQW_GEMINI_MODEL", "flash-low")
 QUOTA_WINDOW_HOURS = 5.0
 TASK_NAME = "AIQuotaWarmer_5HourLimit"
+# The Scheduled Task runs this long after a window resets, so a running
+# watcher, which warms within seconds of the reset, goes first.
+TASK_DELAY_SEC = 60
 
 
 def _normalize_codex_model(model: str) -> str:
@@ -2050,6 +2055,12 @@ def _fmt_epoch(epoch):
     return datetime.datetime.fromtimestamp(float(epoch)).strftime("%I:%M:%S %p")
 
 
+def _fmt_when(epoch):
+    """Like _fmt_epoch, with the weekday when it is not today."""
+    dt = datetime.datetime.fromtimestamp(float(epoch))
+    return dt.strftime("%I:%M:%S %p" if dt.date() == datetime.date.today() else "%a %I:%M:%S %p")
+
+
 def run_trigger_batch(target="all", prompt=DEFAULT_PROMPT, codex_path=None, claude_path=None,
                       notify=True, quiet=False, accounts=None, claude_model=None, codex_model=None,
                       gemini_path=None, gemini_model=None):
@@ -2268,6 +2279,14 @@ def install_scheduled_task(schedule_mode="interval", interval_hours=5, time_str=
             print("    Catch-up: ON (a run missed while the PC was off fires at next boot)")
         else:
             print("    Catch-up: could not be enabled; the task still runs on schedule.")
+        if schedule_mode == "interval":
+            # Every run moves the next one to just after the next 5-hour reset;
+            # the first is moved now, from the windows already known.
+            moved = follow_resets_with_task()
+            if moved:
+                print(f"    Next  : {_fmt_when(moved[0])}, {moved[1]}")
+            print("    Each run warms the accounts whose 5-hour window has ended, then moves the next")
+            print(f"    run to just after the next reset ({hours}h apart while no reset is known).")
         return True
 
     print(f"[-] Failed to install Scheduled Task: {(res.stderr or res.stdout or '').strip()}")
@@ -2297,6 +2316,69 @@ def _apply_task_catchup_settings():
         return res.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _task_powershell(script):
+    """Runs a short ScheduledTasks script; returns the last word it printed ("" for none), or None when it failed."""
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = (res.stdout or "").split()
+    return (words[-1] if words else "") if res.returncode == 0 else None
+
+
+def arm_scheduled_task(when, task_name=TASK_NAME):
+    """
+    Moves the next run of an every-N-hours Scheduled Task to `when` (epoch),
+    keeping its repeat as the fallback should a run not move it on. A daily
+    or at-startup task is left alone. Returns the epoch Task Scheduler now
+    runs it at, or None (no such task, not an every-N-hours one, or refused).
+
+    The time goes to PowerShell as a Unix epoch, so no locale's date format
+    is involved; like the catch-up setting, it needs no admin rights.
+    """
+    if not _IS_WINDOWS:
+        return None
+    when = int(max(float(when), time.time() + 30))
+    out = _task_powershell(
+        "$ErrorActionPreference = 'Stop'; "
+        f"$task = Get-ScheduledTask -TaskName '{task_name}'; "
+        f"$at = [DateTimeOffset]::FromUnixTimeSeconds({when}).LocalDateTime; "
+        "$moved = $false; "
+        "$triggers = @(foreach ($t in $task.Triggers) { "
+        "if (-not $moved -and $t.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and $t.Repetition.Interval) { "
+        "$moved = $true; New-ScheduledTaskTrigger -Once -At $at "
+        "-RepetitionInterval ([Xml.XmlConvert]::ToTimeSpan($t.Repetition.Interval)) "
+        "} else { $t } }); "
+        "if ($moved) { "
+        f"Set-ScheduledTask -TaskName '{task_name}' -Trigger $triggers | Out-Null; "
+        f"[DateTimeOffset]::new((Get-ScheduledTaskInfo -TaskName '{task_name}').NextRunTime).ToUnixTimeSeconds() }}"
+    )
+    try:
+        return float(out) if out else None
+    except ValueError:
+        return None
+
+
+def scheduled_task_next_run(task_name=TASK_NAME):
+    """(installed, next run as an epoch or None) of the Scheduled Task; an at-startup task has no next run."""
+    if not _IS_WINDOWS:
+        return False, None
+    out = _task_powershell(
+        f"$i = Get-ScheduledTaskInfo -TaskName '{task_name}' -ErrorAction Stop; "
+        "if ($i.NextRunTime) { [DateTimeOffset]::new($i.NextRunTime).ToUnixTimeSeconds() }"
+    )
+    if out is None:
+        return False, None
+    try:
+        return True, float(out) if out else None
+    except ValueError:
+        return True, None
 
 
 def wait_for_network(timeout_sec=90.0, host="api.anthropic.com"):
@@ -2642,6 +2724,11 @@ def print_status(accounts=None):
     print("=" * 70)
     print(f"  Current Time              : {now.strftime('%Y-%m-%d %I:%M:%S %p')}")
     print(f"  Auto-Run on PC Restart    : {'[ENABLED - Runs on Boot]' if is_startup_installed() else '[DISABLED]'}")
+    installed, next_run = scheduled_task_next_run()
+    if next_run:
+        print(f"  Scheduled Task            : [NEXT RUN {_fmt_when(next_run)}]")
+    else:
+        print(f"  Scheduled Task            : {'[INSTALLED - no timed run]' if installed else '[NOT INSTALLED]'}")
     start = get_daily_start()
     if start:
         holding = " [HOLDING NOW]" if schedule_hold(start) else ""
@@ -2668,7 +2755,8 @@ def print_status(accounts=None):
                 ts = "??"
             res_list = [f"{k.upper()} {'OK' if v.get('success') else 'ERR'}"
                         for k, v in (t.get("results") or {}).items()]
-            print(f"    [{ts}] {', '.join(res_list) or 'no targets'}")
+            via = " (watcher)" if t.get("source") == "watcher" else ""
+            print(f"    [{ts}] {', '.join(res_list) or 'no targets'}{via}")
     else:
         print("    No trigger history recorded yet.")
     print("=" * 70 + "\n")
@@ -2836,15 +2924,113 @@ def schedule_status(now=None):
 
 
 # ---------------------------------------------------------------------------
+# Warming just after each reset (--now and the Scheduled Task)
+# ---------------------------------------------------------------------------
+#
+# A warm-up while a 5-hour window is still open starts nothing: it only spends
+# quota in that window, and the next window opens with the first request after
+# the reset. So --now reads every window first (free) and warms only the
+# accounts whose window has ended, and every run moves an every-N-hours
+# Scheduled Task to a minute after the next reset: its warm-ups land just
+# after each window instead of at fixed times.
+
+def due_accounts(accounts, notify=True, log=print):
+    """
+    Of `accounts`, the ones a warm-up now would start a window for: their
+    5-hour window has ended and their cooldown has lapsed. Every window is
+    read fresh first, so one opened elsewhere counts too; the accounts left
+    out are reported with why.
+    """
+    report_signed_out(refresh_live_status(accounts, force=True), notify=notify, log=log)
+    usage = get_all_usage(accounts, force=True)
+    state = load_state()
+    due = []
+    for acc in accounts:
+        u = usage[acc.key]
+        wait = cooldown_remaining(acc.key, state)
+        if u.get("status") == "ERROR":
+            log(f"[-] {acc.label}: its 5-hour window could not be read ({u.get('error')}), so it is not warmed.")
+        elif u.get("status") == "LIMITED":
+            log(f"[*] {acc.label}: weekly limit used up until {u.get('window_reset')}, so it is not warmed.")
+        elif u.get("is_active"):
+            log(f"[*] {acc.label}: 5-hour window open until {u.get('window_reset')}. Not warmed: "
+                "a warm-up starts nothing before then.")
+        elif wait > 0:
+            log(f"[*] {acc.label} is in cooldown for another "
+                f"{int(wait // 60)}m {int(wait % 60)}s. Use --force to override.")
+        else:
+            due.append(acc)
+    return due
+
+
+def next_warm_up(accounts, usage, state=None, now=None):
+    """
+    When `accounts` next need a warm-up, as (epoch, why): when the earliest
+    open 5-hour window resets, or when a lapsed window's cooldown ends; a time
+    in the daily start's hold moves to the start. An account known to be
+    signed out, or whose window could not be read, does not count - it is
+    tried whenever the next warm-up comes anyway. None when no account is
+    waiting for anything.
+    """
+    now = time.time() if now is None else now
+    state = load_state() if state is None else state
+    best = None
+    for acc in accounts:
+        u = usage.get(acc.key) or {}
+        entry = state.get(acc.key) or {}
+        if u.get("status") == "ERROR" or (entry.get("login") or {}).get("logged_in") is False:
+            continue
+        if u.get("is_active"):
+            if not u.get("reset_epoch"):
+                continue
+            at = float(u["reset_epoch"])
+            limit = "weekly limit" if u.get("status") == "LIMITED" else "5-hour window"
+            why = f"just after {acc.label}'s {limit} resets"
+        else:
+            at = now + cooldown_remaining(acc.key, state)
+            if int(entry.get("consecutive_failures", 0) or 0):
+                why = f"when {acc.label}'s retry backoff ends"
+            elif at > now:
+                why = f"when {acc.label}'s cooldown ends"
+            else:
+                why = f"for {acc.label}, whose 5-hour window has ended"
+        if best is None or at < best[0]:
+            best = (at, why)
+    if best is None:
+        return None
+    start = get_daily_start()
+    resume = schedule_hold(start, max(best[0], now))
+    return (resume, f"right after the {start} daily start") if resume else best
+
+
+def follow_resets_with_task():
+    """
+    Moves an every-N-hours Scheduled Task to a minute after the next warm-up
+    comes due - usually the next 5-hour reset. Returns (epoch the task now
+    runs at, why), or None when it was left as it was: none installed, a
+    daily or at-startup one, or nothing to wait for (it keeps its repeat).
+    """
+    if not _IS_WINDOWS:
+        return None
+    accounts = load_accounts()
+    due = next_warm_up(accounts, get_all_usage(accounts, force=True))
+    if due is None:
+        return None
+    at = arm_scheduled_task(due[0] + TASK_DELAY_SEC)
+    return (at, due[1]) if at else None
+
+
+# ---------------------------------------------------------------------------
 # Adaptive watcher
 # ---------------------------------------------------------------------------
 
 def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=print,
-                    claude_model=None, codex_model=None, gemini_model=None):
+                    claude_model=None, codex_model=None, gemini_model=None, results=None):
     """
     Warms one account if its window has lapsed and its cooldown has elapsed.
 
-    Returns True when a warm attempt was actually made.
+    Returns True when a warm attempt was actually made; its result also goes
+    into the dict `results`, when given, under the account's key.
     """
     if isinstance(account, str):
         # Older callers passed a bare tool name ("claude" / "codex").
@@ -2863,6 +3049,8 @@ def warm_if_expired(account, usage, prompt=DEFAULT_PROMPT, notify=True, log=prin
     res = trigger_account(account, prompt, claude_model=claude_model, codex_model=codex_model,
                           gemini_model=gemini_model)
     entry = record_attempt(account.key, bool(res.get("success")), window=res.get("window"), error=res.get("error"))
+    if results is not None:
+        results[account.key] = res
 
     if res.get("success"):
         resets_at = (res.get("window") or {}).get("resets_at")
@@ -2927,17 +3115,32 @@ def warm_cycle(accounts, prompt=DEFAULT_PROMPT, notify=True, log=print, idle_sle
             log(f"[{datetime.datetime.now():%I:%M:%S %p}] Holding warm-ups until the {start} daily start "
                 f"({', '.join(a.label for a in due)} waiting).")
         due = []
+    started = datetime.datetime.now()
+    results = {}
     threads = [
         threading.Thread(target=warm_if_expired, args=(a, usage[a.key]),
                          kwargs={"prompt": prompt, "notify": notify, "log": log,
                                  "claude_model": claude_model, "codex_model": codex_model,
-                                 "gemini_model": gemini_model}, daemon=True)
+                                 "gemini_model": gemini_model, "results": results}, daemon=True)
         for a in due
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    if results:
+        # In the history beside --now's runs, so every warm-up shows when it
+        # came - just after its window reset - and what it got.
+        results = {a.key: results[a.key] for a in due if a.key in results}
+        save_history_entry({
+            "timestamp": started.isoformat(),
+            "reset_at": (started + datetime.timedelta(hours=QUOTA_WINDOW_HOURS)).isoformat(),
+            "prompt": prompt,
+            "target": ",".join(results),
+            "source": "watcher",
+            "results": results,
+            "any_success": any(r.get("success") for r in results.values()),
+        })
 
     state = load_state()
     waits = []
@@ -3072,7 +3275,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("--now", action="store_true", help="Trigger warmup immediately (default action)")
+    parser.add_argument("--now", action="store_true",
+                        help="Warm every account whose 5-hour window has ended (default action)")
     parser.add_argument("--target", choices=["all", "codex", "claude", "gemini"], default="all",
                         help="Limit to one tool's accounts (default: all)")
     parser.add_argument("--account", action="append", metavar="ACCOUNT",
@@ -3093,10 +3297,13 @@ def main():
     parser.add_argument("--daily-start", metavar="HH:MM",
                         help="Time of the day's first warm-up; the next follow every 5 hours "
                              "(07:00 -> 12:00, 17:00, 22:00). 'off' warms whenever a window resets")
-    parser.add_argument("--interval", type=float, default=5.0, help="Interval in hours for the scheduled task (default: 5.0)")
+    parser.add_argument("--interval", type=float, default=5.0,
+                        help="Hours between scheduled task runs while no reset is known; each run moves the "
+                             "next one to just after the next 5-hour reset (default: 5.0)")
     parser.add_argument("--no-notify", action="store_true", help="Disable Windows desktop notifications")
     parser.add_argument("--force", action="store_true",
-                        help="Ignore the per-account cooldown and the daily start's pause for --now")
+                        help="With --now: warm even inside an open 5-hour window, the per-account cooldown "
+                             "or the daily start's pause")
     parser.add_argument("--codex-path", default=None, help="Custom path to the codex executable")
     parser.add_argument("--claude-path", default=None, help="Custom path to the claude CLI")
     parser.add_argument("--agy-path", dest="gemini_path", default=None, metavar="PATH",
@@ -3189,23 +3396,21 @@ def main():
                                    gemini_model=args.gemini_model)
         return
 
-    # Default action: warm now. Respects the backoff and the daily start unless
-    # --force is given, so a Scheduled Task firing into a broken login cannot
-    # hammer the CLI, nor open a window that would run into the daily start.
-    if not args.force:
+    # Default action: warm now. Unless --force is given, an account is only
+    # warmed once its 5-hour window has ended - a warm-up inside an open one
+    # starts nothing - and the backoff and the daily start are respected, so a
+    # Scheduled Task firing into a broken login cannot hammer the CLI, nor open
+    # a window that would run into the daily start.
+    if not args.force and selected:
         start = get_daily_start()
         if schedule_hold(start):
             print(f"[*] Holding warm-ups until the {start} daily start: a window opened now would still "
                   "be running then. Use --force to warm anyway.")
-            return
-        state = load_state()
-        blocked = [a for a in selected if cooldown_remaining(a.key, state) > 0]
-        for a in blocked:
-            remaining = cooldown_remaining(a.key, state)
-            print(f"[*] {a.label} is in cooldown for another "
-                  f"{int(remaining // 60)}m {int(remaining % 60)}s. Use --force to override.")
-        selected = [a for a in selected if a not in blocked]
-        if blocked and not selected:
+            selected = []
+        else:
+            selected = due_accounts(selected, notify=not args.no_notify)
+        if not selected:
+            _report_next_scheduled_run()
             return
 
     run_trigger_batch(
@@ -3220,6 +3425,15 @@ def main():
         gemini_path=args.gemini_path,
         gemini_model=args.gemini_model,
     )
+    _report_next_scheduled_run()
+
+
+def _report_next_scheduled_run():
+    # Every run moves an every-N-hours Scheduled Task on to just after the next
+    # reset, so it warms each window as it ends rather than at fixed times.
+    moved = follow_resets_with_task()
+    if moved:
+        print(f"[*] Next scheduled warm-up: {_fmt_when(moved[0])}, {moved[1]}.")
 
 
 def _cli_add_account(args):

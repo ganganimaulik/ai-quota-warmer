@@ -205,11 +205,19 @@ launcher into your Startup folder. On every login it runs `quota_warmer.py --loo
 watches every account's window and fires a warm-up *the instant* one resets — no fixed schedule,
 unless you pick a daily start (see **Daily Start Time** below).
 
-**2. Windows Scheduled Task.** `--install-task` registers a plain every-5-hours job.
-No admin rights needed.
+**2. Windows Scheduled Task.** `--install-task` registers a job that runs `--now` just after
+each 5-hour window resets. Every run reads each account's reset time first (free), warms only the
+accounts whose window has ended, then moves the task's next run to a minute after the next reset.
+A running watcher warms within seconds of the reset, so the task usually finds the new window
+already open and only moves on. The 5-hour repeat stays as a fallback for when no reset is known.
+A daily or at-startup task (`--task-mode daily` / `startup`) keeps its own times, but skips open
+windows the same way. No admin rights needed.
 
 Safety rails on both:
 
+- **Never warms an open window.** A warm-up while a window is still running starts nothing: it
+  only spends quota in that window, and the next one opens with the first request after the
+  reset. `--now` skips those accounts and says until when each window runs (`--force` warms anyway).
 - **Single instance.** A lock file (`~/.ai_quota_warmer/daemon.lock`) means the Startup
   daemon and an open dashboard never double-ping. Whichever starts first does the warming.
 - **Persistent cooldown.** An account is warmed at most once per 5 minutes, and the cooldown
@@ -247,7 +255,8 @@ python quota_warmer.py --daily-start off     # back to warming whenever a window
 - The watcher keeps the schedule: the Startup daemon (`--install-startup`), or the dashboard
   while it is open. A running watcher picks up a change within about 15 seconds.
 - `--now`, and so the Scheduled Task, also waits out those 5 hours unless `--force` is given, so
-  neither opens a window that runs into the daily start. The task otherwise keeps its own times.
+  neither opens a window that runs into the daily start. The task's next run then moves to just
+  after the daily start.
 
 ---
 
@@ -277,14 +286,14 @@ python quota_warmer.py --daily-start off     # back to warming whenever a window
 ```
 python quota_warmer.py [options]
 
-  --now                  Warm up immediately (default action)
+  --now                  Warm every account whose 5-hour window has ended (default action)
   --target {all,codex,claude,gemini}   Limit to one tool's accounts
   --account ACCOUNT      Limit to claude, codex, gemini or TOOL:NAME, e.g. gemini:work (repeatable)
   --prompt TEXT          Prompt to send (default: "hi")
   --claude-model / --codex-model / --gemini-model MODEL
                          Warm-up models (default: haiku / luna / flash-low, the newest
                          Gemini Flash at low effort; also flash-medium, pro-low, ... or an id)
-  --force                Ignore the cooldown and the daily start's pause for --now
+  --force                With --now: warm even inside an open window, the cooldown or the daily start's pause
   --status               Show real 5-hour windows, quota %, and history
   --list-accounts        Who each account is signed in as, free (alias: --check-login)
   --loop                 Run the adaptive watcher in the foreground
@@ -299,7 +308,8 @@ python quota_warmer.py [options]
   --install-task / --uninstall-task            Windows Scheduled Task
   --task-mode {interval,daily,startup}
   --task-time HH:MM      Time for --task-mode daily
-  --interval HOURS       Hours between scheduled runs (1-23)
+  --interval HOURS       Hours between scheduled runs while no reset is known (1-23); each run
+                         moves the next one to just after the next 5-hour reset
   --no-notify            Suppress desktop notifications
 
   --codex-path / --claude-path / --agy-path    Override CLI locations
@@ -316,7 +326,7 @@ and `AQW_CLAUDE_MODEL` / `AQW_CODEX_MODEL` / `AQW_GEMINI_MODEL` for the model de
 | Path | Contents |
 | :--- | :--- |
 | `~/.ai_quota_warmer/accounts.json` | Registered accounts (absent = just the two default accounts) |
-| `~/.ai_quota_warmer/history.json` | Last 100 trigger results (atomic writes) |
+| `~/.ai_quota_warmer/history.json` | Last 100 warm-up runs, the watcher's included (atomic writes) |
 | `~/.ai_quota_warmer/state.json` | Per-account cooldown, failure counters and the last exact Claude and Gemini windows |
 | `~/.ai_quota_warmer/settings.json` | The daily start, if one is set |
 | `~/.ai_quota_warmer/daemon.lock` | Single-instance lock held by the running watcher |
@@ -351,6 +361,7 @@ in your browser could POST to the local API and install scheduled tasks or burn 
 | Added Gemini account: "agy did not use ... own sign-in" | The installed `agy` no longer keeps sign-ins apart the way this version expects, so nothing is warmed for that account. Your main login is untouched; update AI Quota Warmer |
 | Two Gemini accounts show the same email | The browser picked the already signed-in Google account. Use **Sign in again** on that card, type `/logout` and then `/login`, and open the link in a private/incognito window |
 | `--status` shows `EXPIRED` right after a successful warm-up | Session logs can lag a second or two; re-run `--status` |
+| `--now` warms nothing: "5-hour window open until ..." | Expected: a warm-up starts nothing while the window runs. The watcher and the Scheduled Task warm just after it resets; `--force` warms anyway |
 | Dashboard says "another daemon is running" | Expected — the Startup watcher already has it covered |
 | `install_task.ps1` says "Access is denied" | Use `python quota_warmer.py --install-task` instead (no admin needed) |
 | Scheduled task never fires | Confirm it exists: `schtasks /query /tn AIQuotaWarmer_5HourLimit` |

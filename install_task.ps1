@@ -65,7 +65,10 @@ try {
     Write-Host "    Mode: $Mode"
     Write-Host "    Triggers: $($Triggers.Count) active trigger(s)"
     Write-Host "    * Auto-runs on system restart/login: $(if ($Mode -in @('all', 'logon')) { 'YES' } else { 'NO' })"
-    Write-Host "    * Interval: Every $IntervalHours hour(s)"
+    if ($Mode -in @('all', 'interval')) {
+        Write-Host "    * Interval: Every $IntervalHours hour(s) until the first run, which moves the next one"
+        Write-Host "      to just after the next 5-hour reset (each run does the same)"
+    }
     Write-Host "    * Start When Available (Catch-up if PC was off): YES"
 } catch {
     Write-Host "[-] Failed to register task: $_" -ForegroundColor Red

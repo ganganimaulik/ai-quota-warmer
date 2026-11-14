@@ -44,6 +44,7 @@ from quota_warmer import (
     uninstall_startup_autorun,
     install_scheduled_task,
     uninstall_scheduled_task,
+    scheduled_task_next_run,
     set_daily_start,
     describe_daily_start,
     schedule_status,
@@ -427,11 +428,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 interval = 5.0
             time_str = str(payload.get("time") or "08:00")
             ok = install_scheduled_task(schedule_mode=mode, interval_hours=interval, time_str=time_str)
+            next_run = scheduled_task_next_run()[1] if ok else None
+            next_text = datetime.fromtimestamp(next_run).strftime("%a %I:%M %p") if next_run else None
+            note = f", next run {next_text}" if next_text else ""
             push_event(
-                f"Scheduled task install ({mode}) {'succeeded' if ok else 'failed - see console'}.",
+                f"Scheduled task install ({mode}) {'succeeded' if ok else 'failed - see console'}{note}.",
                 "success" if ok else "error",
             )
-            self.send_json({"status": "installed" if ok else "failed", "ok": ok, "mode": mode, "interval": interval})
+            self.send_json({"status": "installed" if ok else "failed", "ok": ok, "mode": mode, "interval": interval,
+                            "next_run": next_text})
             return
 
         self.send_error(404, "Not Found")
@@ -1097,8 +1102,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="btn btn-secondary btn-sm" onclick="openAddForm()">
           ➕ Add Account
         </button>
-        <button class="btn btn-secondary btn-sm" onclick="scheduleTask('interval', 5)">
-          ⏱️ Run Every 5h (Task Scheduler)
+        <button class="btn btn-secondary btn-sm" onclick="scheduleTask('interval', 5)"
+                title="A Windows task that warms each account a minute after its 5-hour window resets, also while this page is closed">
+          ⏱️ Warm After Each Reset (Task Scheduler)
         </button>
         <button class="btn btn-secondary btn-sm" onclick="checkLogins()">
           🔍 Check Logins
@@ -1135,6 +1141,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     let lastEventKey = '';
     let schedule = { daily_start: null, window_minutes: 300 };  // the saved daily start, from the server
     let startupOn = false;
+    let autoWarmOn = true;        // some watcher warms each window as it resets
 
     // Static skeleton only - account names, paths and readings go in through
     // textContent so nothing from disk is ever parsed as HTML.
@@ -1387,7 +1394,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       } else if (d.status === 'LIMITED') {
         sub = `Weekly limit used up · resets ${d.week_reset}. Auto-warm waits for it, so no AI credits are spent.`;
       } else if (d.is_active) {
-        sub = `Active 5h window (${d.progress_pct}% elapsed) · via ${d.source}`;
+        let next = '';
+        if (autoWarmOn) {
+          next = heldUntilStart(d.reset_epoch)
+            ? ` · next warm-up at the ${clockText(clockMinutes(schedule.daily_start))} daily start`
+            : ' · next warm-up just after it resets';
+        }
+        sub = `Active 5h window (${d.progress_pct}% elapsed)${next} · via ${d.source}`;
       } else if (schedule.held_until) {
         sub = `Window reset. Next warm-up at the ${clockText(clockMinutes(schedule.daily_start))} daily start.`;
       } else if (failures > 0) {
@@ -1406,6 +1419,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('chkAutoWarm').checked = !!data.adaptive_auto_warm;
       document.getElementById('watcherState').textContent =
         data.watcher_active ? '(watching)' : '(handled by background daemon)';
+      // The page's own watcher can be switched off; a daemon elsewhere always warms.
+      autoWarmOn = !data.watcher_active || !!data.adaptive_auto_warm;
       syncSchedule(data);  // before the cards: their text says when a held warm-up comes
 
       // Rebuild only when the account list changes (e.g. one was added from the CLI).
@@ -1494,10 +1509,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     async function scheduleTask(mode, interval = 5) {
-      log(`Configuring Task Scheduler for ${mode} (${interval}h)...`, 'info');
+      log('Setting up the Task Scheduler warm-up: each run warms the accounts whose 5-hour window has ended, '
+        + 'then moves the next run to just after the next reset...', 'info');
       try {
         const data = await post('/api/schedule-task', { mode, interval });
-        log(`Task Scheduler: ${data.ok ? 'installed (' + mode + ')' : 'FAILED — see the dashboard console window'}`,
+        const next = data.next_run ? `, next run ${data.next_run}` : '';
+        log(`Task Scheduler: ${data.ok ? 'installed (' + mode + ')' + next : 'FAILED — see the dashboard console window'}`,
             data.ok ? 'success' : 'error');
       } catch (err) {
         log('Schedule error: ' + err.message, 'error');
@@ -1517,6 +1534,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const m = ((minutes % 1440) + 1440) % 1440;
       return new Date(2000, 0, 1, Math.floor(m / 60), m % 60)
         .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    }
+
+    // Whether a warm-up due at `epoch` waits for the daily start: as schedule_hold()
+    // in quota_warmer.py, from a window-length before the start until it.
+    function heldUntilStart(epoch) {
+      if (!schedule.daily_start || !epoch) return false;
+      const t = new Date(Number(epoch) * 1000);
+      const ahead = (clockMinutes(schedule.daily_start) - (t.getHours() * 60 + t.getMinutes()) + 1440) % 1440;
+      return ahead > 0 && ahead <= schedule.window_minutes;
     }
 
     // As daily_warm_times() in quota_warmer.py: each window ends by the next day's start.
